@@ -35,13 +35,15 @@ class UnifiedTTSProcessor:
         encode: str = "wav",           # "wav" or "pcm16"
         chunk_tokens: int = 25,
         temperature: float = 0.8,
-        cfg_weight: float = 0.5,
+        cfg_weight: float = 0.1,
+        exaggeration: float = 0.6,
     ):
         self.ref_audio_dir = Path(ref_audio_dir)
         self.encode = encode
         self.chunk_tokens = chunk_tokens
         self.temperature = temperature
         self.cfg_weight = cfg_weight
+        self.exaggeration = exaggeration
 
         # Device autodetect
         if device is None:
@@ -119,6 +121,7 @@ class UnifiedTTSProcessor:
                     chunk_size=self.chunk_tokens,
                     temperature=self.temperature,
                     cfg_weight=self.cfg_weight,
+                    exaggeration=self.exaggeration,
                     print_metrics=False,
                 ):
                     yield self._encode_chunk(audio_chunk, self.model.sr)
@@ -147,7 +150,7 @@ class UnifiedTTSProcessor:
             gen = self.model.generate_stream(
                 text=text, audio_prompt_path=None, chunk_size=10,
                 exaggeration=0.7,
-                temperature=0.8, cfg_weight=0.3, print_metrics=False
+                temperature=0.8, cfg_weight=0.1, print_metrics=False
             )
             async for audio_chunk, _m in gen:
                 _ = audio_chunk

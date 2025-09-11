@@ -92,11 +92,23 @@ class Config:
     def MONGO_CONNECTION_STRING(self) -> str:
         encoded_pass = quote_plus(self.MONGO_PASS)
         return f"mongodb://{self.MONGO_USER}:{encoded_pass}@{self.MONGO_HOST}/{self.MONGO_AUTH_SOURCE}"
+    @property
+    def MONGO_CONNECTION_STRING(self) -> str:
+        from urllib.parse import quote_plus
+        encoded_pass = quote_plus(self.MONGO_PASS)
+        return (
+            f"mongodb://{self.MONGO_USER}:{encoded_pass}"
+            f"@{self.MONGO_HOST}/ml_notes"
+            f"?authSource=admin"
+            f"&maxPoolSize={self.MONGO_MAX_POOL_SIZE}"
+            f"&serverSelectionTimeoutMS={self.MONGO_SERVER_SELECTION_TIMEOUT}"
+        )
 
     @property
     def mongodb_connection_string(self) -> str:
         """Alias for consistency with weekly_interview"""
         return self.MONGO_CONNECTION_STRING
+
 
     # =========================================================================
     # COLLECTION NAMES
@@ -201,6 +213,7 @@ class Config:
     OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "300"))
 
     GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
+    GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
     GROQ_TIMEOUT = int(os.getenv("GROQ_TIMEOUT", "60"))
     GROQ_TEMPERATURE = float(os.getenv("GROQ_TEMPERATURE", "0.7"))
     GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "3000"))
@@ -212,6 +225,11 @@ class Config:
     MAX_MESSAGE_SIZE = int(os.getenv("MAX_MESSAGE_SIZE", "16777216"))
     SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT", "3600"))
     MAX_ACTIVE_SESSIONS = int(os.getenv("MAX_ACTIVE_SESSIONS", "100"))
+
+    # Hard/soft cutoff and final-answer behavior (seconds)
+    SESSION_MAX_SECONDS = int(os.getenv("SESSION_MAX_SECONDS", "900"))              # 15 minutes
+    SESSION_SOFT_CUTOFF_SECONDS = int(os.getenv("SESSION_SOFT_CUTOFF_SECONDS", "10"))
+    FINAL_ANSWER_GRACE_SECONDS = int(os.getenv("FINAL_ANSWER_GRACE_SECONDS", "0"))  # 0 = take reply then end immediately
 
     # =========================================================================
     # PERFORMANCE
@@ -287,3 +305,9 @@ if not validation["valid"]:
 # Ensure required dirs exist
 for directory in [config.AUDIO_DIR, config.TEMP_DIR, config.REPORTS_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
+
+QUESTION_TIMEOUT_SECONDS = 15
+DEFAULT_ANSWER_TEXT = "I need more time to think about this."
+AUTO_ADVANCE_ENABLED = True
+MIN_AUDIO_SIZE_BYTES = 50
+MAX_CLARIFICATION_ATTEMPTS = 3

@@ -114,7 +114,7 @@ sympy==1.13.1
 tabulate==0.9.0
 tenacity==9.1.2
 threadpoolctl==3.6.0
-torch==2.3.1
+torch==2.6.0
 tiktoken==0.9.0
 toml==0.10.2
 tomli==2.2.1

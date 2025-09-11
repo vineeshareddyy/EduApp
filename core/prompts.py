@@ -51,26 +51,29 @@ Think like you're genuinely interested:
 Give me topics separated by '###CHUNK###' only."""
     @staticmethod
     def base_questions_prompt(chunk_content: str) -> str:
-        core = f"""You just heard about this work from your teammate:
+        core = f"""You just read this project/work chunk:
 
-{chunk_content}
+    {chunk_content}
 
-You're genuinely curious and want to know more. Ask {config.BASE_QUESTIONS_PER_CHUNK} questions that show real interest.
+    TASK:
+    Ask {config.BASE_QUESTIONS_PER_CHUNK} questions that show real technical curiosity about THIS chunk only.
 
-RULES:
-- Only ask questions directly related to THIS project/work
-- Do NOT ask personal or unrelated questions
-- Be natural and professional, not poetic
-- Vary the style so questions don't sound repetitive
+    STRICT RULES:
+    - Only ask questions directly related to THIS chunk/topic.
+    - No personal or off-topic questions.
+    - Vary phrasing so nothing feels repetitive.
+    - Be professional, concise, human (not poetic).
 
-Mix different types:
-- Some about the technical details
-- Some about challenges they faced
-- Some about what they learned
-- Some about what's coming next
+    Mix question types:
+    - Technical details / design choices
+    - Challenges faced / trade-offs
+    - Learnings / debugging insights
+    - What’s next / roadmap
 
-FORMAT: Just give numbered questions, each unique and natural."""
+    FORMAT:
+    - Numbered list of unique questions (no answers)."""
         return _append_boundaries(core)
+
 
     @staticmethod
     def followup_analysis_prompt(chunk_content: str, user_response: str) -> str:
@@ -92,48 +95,85 @@ FOLLOWUP: [Another creative one if needed]"""
 
     @staticmethod
     def dynamic_greeting_response(user_input: str, greeting_count: int, context: Dict = None) -> str:
-        conversation_history = context.get('recent_exchanges', []) if context else []
+        """
+        Generates ONE short line for the GREETING phase.
+        Respects:
+        - sentiment_hint: "positive" | "negative" | "neutral"
+        - simple_english: bool
+        - suppress_salutation: bool  (prevents "hi/hello/good morning" again)
+        - user_name, time_of_day, domain
+        """
+        ctx = context or {}
+        conversation_history = ctx.get('recent_exchanges', [])
+        user_name = (ctx.get('user_name') or ctx.get('name') or '').strip()
+        time_of_day = (ctx.get('time_of_day') or '').strip()
+        domain = ctx.get('domain', "today’s technical topic")
         is_final_greeting = (greeting_count + 1) >= config.GREETING_EXCHANGES
 
-        if is_final_greeting:
-            next_instruction = "Now smoothly move to asking about their work. Be natural about the transition - like how you'd really shift topics with a friend."
-        else:
-            next_instruction = "Just have friendly small talk. Respond to what they said like a real person would."
+        # Hints that force the style you want
+        sentiment_hint = (ctx.get("sentiment_hint") or "").lower()
+        simple_english = bool(ctx.get("simple_english", False))
+        suppress_salutation = bool(ctx.get("suppress_salutation", False))
 
-        return f"""You're chatting with a teammate at work. They just said: "{user_input}"
+        simple_note = "Use very simple words. No fancy phrases." if simple_english else ""
 
-Chat so far: {conversation_history[-2:] if conversation_history else "Just started"}
+        # If salutation must be avoided, tell the model clearly
+        salutation_rule = "Do NOT say hello/hi/good morning again." if suppress_salutation else \
+                        "You MAY greet once using time-of-day and name."
 
-{next_instruction}
+        core = f"""You're in the GREETING phase of a technical interview.
 
-BE CREATIVE AND VARIED:
-- Don't use the same response style as before
-- React to what they actually said
-- Sound like a real person, not a template
-- Keep it short (10-15 words)
-- Make it feel genuine
+    User just said: "{user_input}"
+    Recent chat: {conversation_history[-2:] if conversation_history else "Just started"}
+    Candidate name (optional): {user_name or "N/A"}
+    Time-of-day (optional): {time_of_day or "N/A"}
+    Target domain: {domain}
 
-Every response should sound different. Be original."""
+    SENTIMENT HINT: {sentiment_hint or "unknown"}
+    {simple_note}
+    {salutation_rule}
+
+    GOAL
+    - If sentiment is POSITIVE:
+    * Short confirmation, then move to {domain} now.
+    - If sentiment is NEGATIVE:
+    * One empathy line + one motivation line, then ask: "Shall we start?"
+    - If sentiment is NEUTRAL:
+    * Short check-in, then suggest starting {domain}.
+    - If this is the final greeting turn: {('YES' if is_final_greeting else 'NO')}, you MUST transition to {domain} now.
+
+    STYLE
+    - 10–18 words, human, professional.
+    - No small-talk loops. Stay strictly on the interview topic.
+    - Output exactly ONE line.
+
+    OUTPUT
+    One concise line following the rules above."""
+        return _append_boundaries(core)
 
     @staticmethod
     def dynamic_technical_response(context_text: str, user_input: str, next_question: str, session_state: Dict = None) -> str:
-        core = f"""You're having a good work chat. Here's what happened:
+        domain = (session_state or {}).get('domain', 'the interview topic')
 
-{context_text}
+        core = f"""You're in the TECHNICAL round of a {domain} interview.
 
-They just said: "{user_input}"
-You want to ask: "{next_question}"
+    User said: "{user_input}"
+    Next planned question: "{next_question}"
 
-Connect their response to your question in a CREATIVE way. Every transition should be different.
+    RULES:
+    - If user_input is ON-TOPIC → connect naturally and ask the next question.
+    - If OFF-TOPIC (e.g., water tank, food, movies):
+    * Do NOT follow that.
+    * Say one short polite redirect: "Let’s stay on {domain}".
+    * Then immediately ask the planned technical question.
 
-BE ORIGINAL:
-- Don't use boring standard phrases
-- Reference something specific they mentioned
-- Make the connection feel natural
-- Sound interested in their work
-- Keep it short (max 20 words)
+    STYLE:
+    - Simple English, short and clear.
+    - Max 15–18 words.
+    - No modern or fancy talk.
 
-Make each transition unique. Think like a real curious colleague."""
+    OUTPUT:
+    One short line, either connecting naturally or redirecting then asking {domain} question."""
         return _append_boundaries(core)
 
 
@@ -195,7 +235,7 @@ Max 20 words. Be original every time."""
 
     @staticmethod
     def dynamic_fragment_evaluation(concepts_covered: List[str], conversation_exchanges: List[Dict],
-                                session_stats: Dict) -> str:
+                                    session_stats: Dict) -> str:
         concepts_text = "\n".join([f"- {concept}" for concept in concepts_covered])
 
         conversation_summary = []
@@ -206,39 +246,33 @@ Max 20 words. Be original every time."""
             )
         conversation_text = "\n".join(conversation_summary)
 
-        core = f"""You're a team lead writing feedback for your team member after a good standup chat.
-        Use ONLY the provided conversation; do not invent details not present here.
+        core = f"""You're evaluating a technical standup.
 
-        **THEIR PERFORMANCE:**
-        - Topics covered: {session_stats['concepts_covered']}/{session_stats['total_concepts']} ({session_stats['coverage_percentage']}%)
-        - Main questions: {session_stats['main_questions']}
-        - Follow-ups: {session_stats['followup_questions']}
-        - Time: {session_stats['duration_minutes']} minutes
+    SESSION METRICS:
+    - Topics covered: {session_stats['concepts_covered']}/{session_stats['total_concepts']} ({session_stats['coverage_percentage']}%)
+    - Duration: {session_stats['duration_minutes']} minutes
+    - Main questions: {session_stats['main_questions']}, Follow-ups: {session_stats['followup_questions']}
 
-        **TOPICS THEY TALKED ABOUT:**
-        {concepts_text}
+    TOPICS:
+    {concepts_text}
 
-        **SAMPLE CONVERSATION:**
-        {conversation_text}
+    RECENT EXCHANGES:
+    {conversation_text}
 
-        **WRITE CREATIVE FEEDBACK**: Don't use boring template language. Write like you actually care about helping them grow.
+    TASK:
+    Score ONLY these categories:
+    - Communication (clarity, flow): 0–2
+    - Confidence (tone, assertiveness): 0–2
+    - Technical (topics covered & accuracy): 0–6
 
-        Cover these areas creatively:
-        1. **Coverage**: How well they covered different topics
-        2. **Communication**: How clearly they explained things
-        3. **Strengths**: What they did really well (be specific)
-        4. **Growth areas**: What they can improve (be helpful)
-        5. **Overall**: Your honest assessment
+    Then write short feedback (≤120 words) that is concrete and helpful.
 
-        **STYLE**:
-        - Write like a real manager who cares
-        - Use simple English
-        - Be encouraging but honest
-        - Make it personal, not generic
-        - Keep under 250 words
-
-        End with: Score: X/10
-        Be creative and genuine in your feedback."""
+    OUTPUT FORMAT (exactly):
+    COMMUNICATION: X/2
+    CONFIDENCE: X/2
+    TECHNICAL: X/6
+    TOTAL: Y/10
+    FEEDBACK: [short, human, specific feedback]"""
         return _append_boundaries(core)
 
 
@@ -254,16 +288,16 @@ Max 20 words. Be original every time."""
     - Total questions: {total_exchanges}
     - Their final words: "{user_final_response}"
 
-    **BE CREATIVE**: End this naturally like a real conversation. Don't use boring standard endings.
+    **GOAL**: Give ONE short, natural closing line that includes a brief thanks and ends the session.
 
-    Think about:
-    - What you learned about their work
-    - How the conversation went
-    - How you'd really thank a teammate
+    **STYLE**
+    - Very short (12–20 words), natural, human.
+    - Must include “Thanks” or “Thank you”.
+    - No follow-up questions.
+    - No bullets, no headings, no extra lines.
 
-    Make it genuine and different each time. Sound like you actually enjoyed the chat.
-
-    Max 25 words. Be original."""
+    **OUTPUT**
+    Output exactly ONE sentence only, nothing else."""
         return _append_boundaries(core)
 
 
@@ -304,7 +338,16 @@ Max 20 words. Be original every time."""
     @staticmethod
     def boundary_offtopic_prompt(topic: str, subtask: str = "") -> str:
         ask = f"What progress since yesterday on {subtask or topic}?"
-        core = f"User is off-topic. Give ONE brief redirect (≤ {getattr(config, 'REDIRECT_MAX_WORDS', 18)} words) and then ask: {ask}"
+        core = f"""User is off-topic (e.g., talking about unrelated things like movies, sports, random analogies).
+    TASK:
+    - Do NOT follow the off-topic content.
+    - Politely redirect in one short line (≤ {getattr(config, 'REDIRECT_MAX_WORDS', 18)} words).
+    - Immediately ask ONE question about THIS topic: {ask}.
+
+    STYLE:
+    - Professional, concise, interview-focused.
+    - Never expand on or question the off-topic subject.
+    - Always bring the user back to the interview topic."""
         return _append_boundaries(core)
 
     @staticmethod
