@@ -215,7 +215,7 @@ class Config:
     GROQ_TRANSCRIPTION_MODEL = os.getenv("GROQ_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
     GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
     GROQ_TIMEOUT = int(os.getenv("GROQ_TIMEOUT", "60"))
-    GROQ_TEMPERATURE = float(os.getenv("GROQ_TEMPERATURE", "0.7"))
+    GROQ_TEMPERATURE = float(os.getenv("GROQ_TEMPERATURE", "0.1"))
     GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "3000"))
 
     # =========================================================================
