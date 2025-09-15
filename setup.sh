@@ -18,7 +18,7 @@ sudo apt-get update && sudo apt-get install -y \
 # === 2. Create Python virtual environment ===
 echo "?? Creating Python virtual environment..."
 if [ ! -d "venv" ]; then
-  python3 -m venv venv
+  python3 -m venv venv 
   echo "? Virtual environment created."
 fi
 source venv/bin/activate
