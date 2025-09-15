@@ -114,23 +114,34 @@ class UltraFastSessionManager:
             logger.error("Failed to create session: %s", e)
             raise Exception(f"Session creation failed: {e}")
         
-    async def generate_silence_response(session_data: SessionData):
+    # replace your current generate_silence_response with this
+    async def generate_silence_response(self, session_data: SessionData):
         try:
             context = {
                 "name": session_data.student_name,
-                "domain": session_data.current_domain or "your work",
+                "domain": getattr(session_data, "current_domain", "your work") or "your work",
                 "simple_english": True,
             }
             prompt = prompts.dynamic_silence_response(context)
             loop = asyncio.get_event_loop()
-            text = await loop.run_in_executor(shared_clients.executor, session_data.conversation_manager._sync_openai_call, prompt)
-            text = text.strip()
+            text = await loop.run_in_executor(
+                shared_clients.executor,
+                self.conversation_manager._sync_openai_call,  # <-- self.
+                prompt,
+            )
+            text = (text or "").strip()
             if not text or len(text.split()) < 3:
                 text = f"Are you comfortable to continue {session_data.student_name}? Let’s start whenever you're ready."
             await session_data.websocket.send_text(json.dumps({"type": "ai_response", "text": text, "status": session_data.current_stage.value}))
-            async for audio_chunk in session_data.tts_processor.generate_ultra_fast_stream(text, session_id=session_data.session_id):
+            async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(  # <-- self.
+                text, session_id=session_data.session_id
+            ):
                 if audio_chunk:
-                    await session_data.websocket.send_text(json.dumps({"type": "audio_chunk", "audio": audio_chunk.hex(), "status": session_data.current_stage.value}))
+                    await session_data.websocket.send_text(json.dumps({
+                        "type": "audio_chunk",
+                        "audio": audio_chunk.hex(),
+                        "status": session_data.current_stage.value
+                    }))
             await session_data.websocket.send_text(json.dumps({"type": "audio_end", "status": session_data.current_stage.value}))
             logger.info("Sent silence-based prompt.")
         except Exception as e:
@@ -167,7 +178,7 @@ class UltraFastSessionManager:
 
             if session_data.summary_manager:
                 session_data.summary_manager.add_answer(default_text)
-
+            
             await self._update_session_state_fast(session_data)
             await self._send_response_with_ultra_fast_audio(session_data, ai_response)
 
@@ -360,7 +371,7 @@ class UltraFastSessionManager:
                 "enable_new_session": True,
                 "evaluation": evaluation,
                 "score": score,
-                "pdf_url": f"/daily_standup/download_results/{session_data.session_id}",
+                "pdf_url": f"/download_results/{session_data.session_id}",
                 "redirect_to": "/dashboard",
             })
 
@@ -708,7 +719,7 @@ class UltraFastSessionManager:
                     if has_covered_enough or approaching_time_limit:
                         session_data.current_stage = SessionStage.COMPLETE
                         logger.info("Session %s moved to COMPLETE stage (covered: %s, time: %s)", 
-                                session_id, has_covered_enough, approaching_time_limit)
+                                session_data.session_id, has_covered_enough, approaching_time_limit)
                         asyncio.create_task(self._finalize_session_fast(session_data))
         except Exception as e:
             logger.error("Session state update error: %s", e)
@@ -873,6 +884,7 @@ async def start_standup_session_fast():
     except Exception as e:
         logger.error("Error starting session: %s", e)
         raise HTTPException(status_code=500, detail=f"Failed to start session: {str(e)}")
+    
 @app.get("/api/summary/{test_id}")
 async def get_standup_summary_fast(test_id: str):
     """Get standup session summary from real database"""
@@ -938,6 +950,66 @@ async def get_standup_summary_fast(test_id: str):
     except Exception as e:
         logger.error(f"? Error getting summary: {e}")
         raise HTTPException(status_code=500, detail=f"Summary retrieval failed: {str(e)}")
+    
+def generate_pdf_report(result: dict, session_id: str) -> bytes:
+        """Generate PDF report from real session data"""
+        try:
+            pdf_buffer = io.BytesIO()
+            doc = SimpleDocTemplate(pdf_buffer, pagesize=LETTER)
+            styles = getSampleStyleSheet()
+            story = []
+            
+            # Title
+            title = f"Daily Standup Report - {result.get('student_name', 'Student')}"
+            story.append(Paragraph(title, styles['Title']))
+            story.append(Spacer(1, 12))
+            
+            # Session info
+            info_text = f"""
+            Session ID: {session_id}
+            Student: {result.get('student_name', 'Unknown')}
+            Date: {datetime.fromtimestamp(result.get('timestamp', time.time())).strftime('%Y-%m-%d %H:%M:%S')}
+            Duration: {result.get('duration', 0)/60:.1f} minutes
+            Total Exchanges: {result.get('total_exchanges', 0)}
+            Score: {result.get('score', 0)}/10
+            """
+            story.append(Paragraph(info_text, styles['Normal']))
+            story.append(Spacer(1, 12))
+            
+            # Fragment analytics if available
+            fragment_analytics = result.get('fragment_analytics', {})
+            if fragment_analytics:
+                story.append(Paragraph("Fragment Coverage Analysis", styles['Heading2']))
+                analytics_text = f"""
+                Total Concepts: {fragment_analytics.get('total_concepts', 0)}
+                Coverage Percentage: {fragment_analytics.get('coverage_percentage', 0)}%
+                Main Questions: {fragment_analytics.get('main_questions', 0)}
+                Follow-up Questions: {fragment_analytics.get('followup_questions', 0)}
+                """
+                story.append(Paragraph(analytics_text, styles['Normal']))
+                story.append(Spacer(1, 12))
+            
+            # Conversation log
+            story.append(Paragraph("Conversation Summary", styles['Heading2']))
+            for exchange in result.get('conversation_log', [])[:15]:
+                if exchange.get('stage') != 'greeting':  # Skip greeting exchanges in PDF
+                    story.append(Paragraph(f"AI: {exchange.get('ai_message', '')}", styles['Normal']))
+                    story.append(Paragraph(f"User: {exchange.get('user_response', '')}", styles['Normal']))
+                    story.append(Spacer(1, 6))
+            
+            # Evaluation
+            if result.get('evaluation'):
+                story.append(Paragraph("Evaluation", styles['Heading2']))
+                story.append(Paragraph(result['evaluation'], styles['Normal']))
+            
+            doc.build(story)
+            pdf_buffer.seek(0)
+            return pdf_buffer.read()
+            
+        except Exception as e:
+            logger.error(f"? PDF generation error: {e}")
+            raise Exception(f"PDF generation failed: {e}")
+        
 @app.get("/download_results/{session_id}")
 async def download_results_fast(session_id: str):
     """Fast PDF generation and download from real data"""
@@ -965,6 +1037,7 @@ async def download_results_fast(session_id: str):
     except Exception as e:
         logger.error(f"? PDF generation error: {e}")
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
+    
 @app.get("/test")
 async def test_endpoint_fast():
     """Fast test endpoint with real configuration"""
@@ -1201,3 +1274,4 @@ async def websocket_endpoint_ultra_fast(websocket: WebSocket, session_id: str):
             
         logger.info("WebSocket cleanup completed for session: %s", session_id)
         # Session cleanup is handled by _finalize_session_fast / _end_due_to_time
+    
