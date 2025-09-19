@@ -109,6 +109,20 @@ class Config:
         """Alias for consistency with weekly_interview"""
         return self.MONGO_CONNECTION_STRING
 
+    # in core/config.py (near other conversation settings)
+    GREETING_LLM_ENABLED = os.getenv("GREETING_LLM_ENABLED", "true").lower() == "true"
+    GREETING_LLM_TIMEOUT_MS = int(os.getenv("GREETING_LLM_TIMEOUT_MS", "1500"))
+    GREETING_GROQ_FALLBACK = os.getenv("GREETING_GROQ_FALLBACK", "true").lower() == "true"
+
+    # config.py
+    MIN_STT_SEGMENT_MS = int(os.getenv("MIN_STT_SEGMENT_MS", "700"))       # don’t transcribe < ~0.7s voiced audio
+    MAX_STT_LATENCY_MS = int(os.getenv("MAX_STT_LATENCY_MS", "1600"))      # flush even if user keeps talking
+    MIN_STT_SEGMENT_BYTES = int(os.getenv("MIN_STT_SEGMENT_BYTES", "8192"))# guard for tiny chunks (webm/opus)
+    CLIENT_SILENCE_THRESHOLD_MS = int(os.getenv("CLIENT_SILENCE_THRESHOLD_MS", "4000"))
+    CLIENT_SILENCE_GRACE_MS = int(os.getenv("CLIENT_SILENCE_GRACE_MS", "250"))
+    FILLER_IGNORE_MAX_TOKENS = int(os.getenv("FILLER_IGNORE_MAX_TOKENS", "2"))  # ignore “yeah”, “thanks”, “and”
+
+
 
     # =========================================================================
     # COLLECTION NAMES
@@ -132,6 +146,9 @@ class Config:
         os.getenv("ESTIMATED_SECONDS_PER_QUESTION", "180")
     )
     BASE_QUESTIONS_PER_CHUNK = int(os.getenv("BASE_QUESTIONS_PER_CHUNK", "3"))
+    # core/config.py
+    SILENCE_CHUNKS_THRESHOLD = 1
+    SILENCE_GRACE_AFTER_GREETING_SECONDS = 4
 
     # =========================================================================
     # WEEKEND MOCKTEST SETTINGS
