@@ -148,8 +148,10 @@ class Config:
     BASE_QUESTIONS_PER_CHUNK = int(os.getenv("BASE_QUESTIONS_PER_CHUNK", "3"))
     # core/config.py
     SILENCE_CHUNKS_THRESHOLD = 1
-    SILENCE_GRACE_AFTER_GREETING_SECONDS = 4
-
+    SILENCE_GRACE_AFTER_GREETING_SECONDS = 2
+    MIN_SESSION_DURATION_SECONDS = 15 * 60  # 15 minutes minimum
+    MAX_EXTENDED_QUESTIONS = 30  # Maximum extended questions to generate
+    
     # =========================================================================
     # WEEKEND MOCKTEST SETTINGS
     # =========================================================================
@@ -328,3 +330,10 @@ DEFAULT_ANSWER_TEXT = "I need more time to think about this."
 AUTO_ADVANCE_ENABLED = True
 MIN_AUDIO_SIZE_BYTES = 50
 MAX_CLARIFICATION_ATTEMPTS = 3
+QA_MONGODB_HOST = "192.168.48.201"
+QA_MONGODB_PORT = 27017
+QA_MONGODB_DATABASE = "ml_notes"           # ✅ FIXED
+QA_MONGODB_USERNAME = "connectly"
+QA_MONGODB_PASSWORD = "LT@connect25"
+QA_MONGODB_AUTH_SOURCE = "admin"           # ✅ FIXED
+QA_COLLECTION = "daily_standup_results"     # ✅ NEW COLLECTION

@@ -26,6 +26,7 @@ source venv/bin/activate
 # === 3. Install Python packages ===
 echo "?? Installing Python dependencies (Torch + CUDA 12.6)..."
 pip install --upgrade pip
+python -m pip install --upgrade pip setuptools wheel
 pip install torch==2.6.0+cu126 torchvision==0.21.0+cu126 torchaudio==2.6.0+cu126 --index-url https://download.pytorch.org/whl/cu126
 pip install -r requirements.txt
 
@@ -64,9 +65,9 @@ generate_certs() {
 generate_certs "./certs"
 
 
-# === 7. Check if ports 8090 and 5174 are available ===
-echo "?? Checking ports 8090 and 5174..."
-for port in 8090 5174; do
+# === 7. Check if ports 8030 and 5174 are available ===
+echo "?? Checking ports 8030 and 5174..."
+for port in 8030 5174; do
   if lsof -i:$port >/dev/null 2>&1; then
     echo "?? Port $port is already in use."
   else

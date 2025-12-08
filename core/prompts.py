@@ -1,20 +1,19 @@
-# core/prompts.py
+# core/prompts.py - IMPROVED VERSION WITH EXTENDED QUESTIONS SUPPORT
 """
 Unified prompts module for all three modules:
-- Daily Standup (creative, varied conversation flow)
+- Daily Standup (direct technical questions from summary + extended web-based questions)
 - Weekend Mocktest (question generation + evaluation)
 - Weekly Interview (natural interviewer prompts + scoring)
-
-Backwards compatibility:
-- daily_standup: uses `prompts` or `Prompts` → provided via DailyStandupPrompts + alias
-- weekend_mocktest: uses `PromptTemplates`, `PromptValidator` → preserved
-- weekly_interview: uses constants + build_* + validate_prompts() → preserved
 """
 
 from __future__ import annotations
 
 from typing import List, Dict, Any
 from .config import config
+import json
+import openai
+from core.database import get_db_manager
+
 # ---- Reusable boundary policy appended to Daily Standup prompts ----
 BOUNDARY_POLICY = f"""
 BOUNDARIES:
@@ -33,8 +32,9 @@ def _append_boundaries(block: str) -> str:
 # =============================================================================
 
 class DailyStandupPrompts:
-    """Creative prompts that force LLM to be original and varied"""
+    """Direct technical questions that match real standup style"""
 
+    # ---------- Summary → chunk topics ----------
     @staticmethod
     def summary_splitting_prompt(summary: str) -> str:
         return f"""You're a curious person who wants to chat about this project work. Break it into {config.SUMMARY_CHUNKS} interesting topics.
@@ -49,6 +49,8 @@ Think like you're genuinely interested:
 - What problems or solutions interest you?
 
 Give me topics separated by '###CHUNK###' only."""
+
+    # ---------- Base questions for a chunk ----------
     @staticmethod
     def base_questions_prompt(chunk_content: str) -> str:
         core = f"""You just read this project/work chunk:
@@ -68,13 +70,13 @@ Give me topics separated by '###CHUNK###' only."""
     - Technical details / design choices
     - Challenges faced / trade-offs
     - Learnings / debugging insights
-    - What’s next / roadmap
+    - What's next / roadmap
 
     FORMAT:
     - Numbered list of unique questions (no answers)."""
         return _append_boundaries(core)
 
-
+    # ---------- Follow-up analysis after user answered ----------
     @staticmethod
     def followup_analysis_prompt(chunk_content: str, user_response: str) -> str:
         core = f"""You asked about: "{chunk_content[:100]}..."
@@ -92,147 +94,506 @@ FORMAT:
 FOLLOWUP: [Your creative question]
 FOLLOWUP: [Another creative one if needed]"""
         return _append_boundaries(core)
-
+     
+    # ---------- GREETING (UPDATED to directly ask about known domain, e.g., SAP) ----------
     @staticmethod
-    def dynamic_greeting_response(user_input: str, greeting_count: int, context: Dict = None) -> str:
-        """
-        Generates ONE short line for the GREETING phase.
-        Respects:
-        - sentiment_hint: "positive" | "negative" | "neutral"
-        - simple_english: bool
-        - suppress_salutation: bool  (prevents "hi/hello/good morning" again)
-        - user_name, time_of_day, domain
-        """
+    def dynamic_greeting_response(*args, **kwargs) -> str:
+        # --- argument normalization ---
+        if len(args) >= 4:
+            _, user_input, greeting_count, context = args[:4]
+        elif len(args) >= 3:
+            user_input = args[0]
+            greeting_count = args[1]
+            context = args[2]
+        elif len(args) == 2:
+            user_input, greeting_count = args
+            context = {}
+        else:
+            user_input = kwargs.get("user_input", "")
+            greeting_count = kwargs.get("greeting_count", 0)
+            context = kwargs.get("context", {})
+
+        # --- context normalization ---
         ctx = context or {}
-        conversation_history = ctx.get('recent_exchanges', [])
-        user_name = (ctx.get('user_name') or ctx.get('name') or '').strip()
-        time_of_day = (ctx.get('time_of_day') or '').strip()
-        domain = ctx.get('domain', "today’s technical topic")
-        is_final_greeting = (greeting_count + 1) >= config.GREETING_EXCHANGES
+        user_name = (ctx.get("user_name") or ctx.get("name") or "").strip()
+        domain = (ctx.get("domain") or "").strip()
 
-        # Hints that force the style you want
-        sentiment_hint = (ctx.get("sentiment_hint") or "").lower()
-        simple_english = bool(ctx.get("simple_english", False))
-        suppress_salutation = bool(ctx.get("suppress_salutation", False))
+        # --- fetch latest summary topic from MongoDB ---
+        try:
+            db = get_db_manager()
+            latest_summary = db._sync_get_summary()
+            if latest_summary:
+                first_line = latest_summary.split("\n")[0].strip()
+                if len(first_line.split()) <= 6:
+                    domain = first_line
+        except Exception:
+            pass
 
-        simple_note = "Use very simple words. No fancy phrases." if simple_english else ""
+        # --- Check conversation phase ---
+        user_input_lower = user_input.lower().strip()
+        
+        # **PHASE 1: Initial Greeting**
+        if not user_input or user_input == "(session start)" or greeting_count == 0:
+            # Determine appropriate greeting based on time of day
+            time_of_day = ctx.get("time_of_day", "morning")
+            if time_of_day == "morning":
+                greeting_example = f"Good morning {user_name}! How are you today?"
+            elif time_of_day == "afternoon":
+                greeting_example = f"Good afternoon {user_name}! How are you doing?"
+            elif time_of_day == "evening":
+                greeting_example = f"Good evening {user_name}! How are you?"
+            else:
+                greeting_example = f"Hello {user_name}! How are you today?"
+            
+            core = f"""
+        You are a friendly mentor starting a daily standup with {user_name}.
 
-        # If salutation must be avoided, tell the model clearly
-        salutation_rule = "Do NOT say hello/hi/good morning again." if suppress_salutation else \
-                        "You MAY greet once using time-of-day and name."
+        TASK:
+        - Greet them based on time of day: It's {time_of_day} now
+        - Use appropriate greeting: "Good {time_of_day}" (e.g., "{greeting_example}")
+        - Keep it warm, brief, and human
+        - DO NOT ask about work topics yet
+        - Max 15 words
 
-        core = f"""You're in the GREETING phase of a technical interview.
+        OUTPUT: One natural greeting sentence only.
+        """
+            return _append_boundaries(core)
+        
+        # **PHASE 2: User replied to greeting**
+        positive_words = ["good", "great", "fine", "well", "okay", "ok", "nice", "alright", "yes", "yeah", "yep", "sure"]
+        is_positive = any(word in user_input_lower for word in positive_words)
+        
+        negative_words = ["not", "bad", "no", "tired", "stressed", "low", "difficult", "tough"]
+        is_negative = any(word in user_input_lower for word in negative_words)
+        
+        reciprocal_phrases = ["how about you", "what about you", "how are you", "how's your", "and you"]
+        asked_reciprocal = any(phrase in user_input_lower for phrase in reciprocal_phrases)
+        
+        # **Handle reciprocal greeting**
+        if asked_reciprocal:
+            if is_negative:
+                core = f"""
+User said: "{user_input}"
+They asked how you're doing but they seem low.
 
-    User just said: "{user_input}"
-    Recent chat: {conversation_history[-2:] if conversation_history else "Just started"}
-    Candidate name (optional): {user_name or "N/A"}
-    Time-of-day (optional): {time_of_day or "N/A"}
-    Target domain: {domain}
+TASK:
+- Show empathy
+- Briefly say you're doing okay
+- Reassure them about {domain} discussion
+- Max 22 words
 
-    SENTIMENT HINT: {sentiment_hint or "unknown"}
-    {simple_note}
-    {salutation_rule}
+EXAMPLE: "I appreciate you asking — I'm doing well. Take your time, and we can discuss your {domain} updates whenever you're ready."
 
-    GOAL
-    - If sentiment is POSITIVE:
-    * Short confirmation, then move to {domain} now.
-    - If sentiment is NEGATIVE:
-    * One empathy line + one motivation line, then ask: "Shall we start?"
-    - If sentiment is NEUTRAL:
-    * Short check-in, then suggest starting {domain}.
-    - If this is the final greeting turn: {('YES' if is_final_greeting else 'NO')}, you MUST transition to {domain} now.
+OUTPUT: One empathetic response.
+"""
+            else:
+                core = f"""
+User said: "{user_input}"
+They asked how you're doing.
 
-    STYLE
-    - 10–18 words, human, professional.
-    - No small-talk loops. Stay strictly on the interview topic.
-    - Output exactly ONE line.
+TASK:
+- Answer briefly that you're doing great
+- Transition to asking if they're ready for {domain} discussion
+- Max 20 words
 
-    OUTPUT
-    One concise line following the rules above."""
-        return _append_boundaries(core)
+EXAMPLE: "I'm doing great, thanks for asking! Shall we discuss your {domain} updates?"
 
+OUTPUT: One warm, transitional response.
+"""
+            return _append_boundaries(core)
+        
+        # **Handle emotional state**
+        if is_negative:
+            core = f"""
+User replied: "{user_input}"
+They seem low.
+
+TASK:
+- Respond with empathy
+- Tell them you can discuss {domain} whenever comfortable
+- Max 18 words
+
+EXAMPLE: "I understand. We can go over your {domain} updates whenever you're ready."
+
+OUTPUT: One empathetic response.
+"""
+            return _append_boundaries(core)
+        
+        elif is_positive:
+            core = f"""
+User replied: "{user_input}"
+They're doing well.
+
+TASK:
+- Acknowledge warmly(DO NOT repeat "Good morning" or any greeting)
+- Ask if ready to start {domain} discussion
+- Max 18 words
+
+EXAMPLE: "That's great! Shall we go over your {domain} updates?"
+
+OUTPUT: One warm, transitional question.
+"""
+            return _append_boundaries(core)
+        
+        else:
+            core = f"""
+User replied: "{user_input}"
+
+TASK:
+- Acknowledge response
+- Ask if ready to discuss {domain}
+- Max 18 words
+
+EXAMPLE: "Thank you! Are you ready to discuss your {domain} work today?"
+
+OUTPUT: One transitional question.
+"""
+            return _append_boundaries(core)
+
+    # ============================================================================
+    # ✅ UPDATED: First Technical Question - DIRECT QUIZ STYLE
+    # ============================================================================
     @staticmethod
-    def dynamic_technical_response(context_text: str, user_input: str, next_question: str, session_state: Dict = None) -> str:
-        domain = (session_state or {}).get('domain', 'the interview topic')
+    def generate_first_technical_question(concept_title: str, concept_content: str, user_greeting: str = "") -> str:
+        """
+        Generate DIRECT technical questions like real standup questions.
+        Style: "What is X?", "How to do Y?", "Which command for Z?"
+        """
+        return f"""
+    You are conducting a technical knowledge check about: {concept_title}
 
-        core = f"""You're in the TECHNICAL round of a {domain} interview.
+    SUMMARY CONTENT:
+    {concept_content[:1500] if concept_content else "General technical discussion"}
 
-    User said: "{user_input}"
-    Next planned question: "{next_question}"
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ⚠️ CRITICAL RULE: THE ANSWER MUST BE IN THE SUMMARY ABOVE ⚠️
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    RULES:
-    - If user_input is ON-TOPIC → connect naturally and ask the next question.
-    - If OFF-TOPIC (e.g., water tank, food, movies):
-    * Do NOT follow that.
-    * Say one short polite redirect: "Let’s stay on {domain}".
-    * Then immediately ask the planned technical question.
+    STEP 1 - IDENTIFY A FACT (not an instruction):
+    ✅ FACTS (use these):
+    - "RFC enables communication between SAP systems" → FACT
+    - "AI algorithms analyze medical images" → FACT
+    - "TensorFlow is a development platform" → FACT
+    - "Transaction SM59 configures connections" → FACT
+    - "Port 3320 is used for target system" → FACT
 
-    STYLE:
-    - Simple English, short and clear.
-    - Max 15–18 words.
-    - No modern or fancy talk.
+    ❌ INSTRUCTIONS (ignore these):
+    - "Identify the specific problem you want to solve" → INSTRUCTION (no answer!)
+    - "Gather relevant data" → INSTRUCTION (no answer!)
+    - "Define the problem statement" → INSTRUCTION (no answer!)
+    - "Choose the right model" → INSTRUCTION (no answer!)
 
-    OUTPUT:
-    One short line, either connecting naturally or redirecting then asking {domain} question."""
-        return _append_boundaries(core)
+    STEP 2 - TURN THE FACT INTO A QUESTION:
+    Pattern: If summary says "X does Y", ask "What does X do?" → Answer: "Y"
 
+    QUESTION PATTERNS:
+    - "What is [term] used for?"
+    - "What does [subject] do/analyze/enable?"
+    - "Which [tool/transaction] is used for [task]?"
+    - "What are the [requirements] for [topic]?"
+    - "How does [subject] assist [object]?"
 
+    STRICT RULES:
+    1. Length: 8-15 words
+    2. Answer MUST be stated in the summary
+    3. NO "you/your": "what do you want", "in your project"
+    4. NO hypotheticals: "what would you", "how would you"
+    5. Direct quiz-style question only
+
+    EXAMPLES BY DOMAIN:
+
+    SAP Summary: "Transaction SM59 configures RFC connections"
+    ✅ "What is transaction SM59 used for?" → Answer: "Configuring RFC connections"
+
+    SAP Summary: "RFC enables communication between SAP systems"
+    ✅ "What does RFC enable?" → Answer: "Communication between SAP systems"
+
+    AI Summary: "AI algorithms analyze medical images to detect abnormalities"
+    ✅ "What do AI algorithms analyze in healthcare?" → Answer: "Medical images"
+    ❌ "What problem do you want AI to solve?" → NO ANSWER IN SUMMARY!
+
+    AI Summary: "TensorFlow and PyTorch are AI development platforms"
+    ✅ "What are examples of AI development platforms?" → Answer: "TensorFlow, PyTorch"
+
+    AI Summary: "Computing resources with sufficient processing power are required"
+    ✅ "What resources are required for AI training?" → Answer: "Computing resources"
+    ❌ "What computing resources are you using?" → ASKS USER, NOT SUMMARY!
+
+    General Summary: "Data sets are used for training and testing AI models"
+    ✅ "What are data sets used for?" → Answer: "Training and testing AI models"
+    ❌ "What data is relevant for your project?" → NO ANSWER IN SUMMARY!
+
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    VALIDATION: Before outputting, ask yourself:
+    "Can someone answer this question by ONLY reading the summary above?"
+    - YES → Output the question
+    - NO → Find a different fact and try again
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    OUTPUT: One direct question (8-15 words):"""
+
+    # ============================================================================
+    # ✅ IMPROVED: Technical Response (Summary-Grounded)
+    # ============================================================================
     @staticmethod
-    def dynamic_followup_response(current_concept_title: str, concept_content: str, 
-                             history: str, previous_question: str, user_response: str,
-                             current_question_number: int, questions_for_concept: int) -> str:
-        core = f"""You're a friendly team lead having standup chat with your team member. Keep it normal and conversational.
+    def dynamic_technical_response(context_text: str, user_input: str, next_question: str, session_state: dict = None) -> str:
+        """
+        Generate a context-aware, technical follow-up question grounded in the MongoDB summary.
+        Keeps tone natural, progressive, and specific.
+        """
 
-**Topic**: {current_concept_title}
-**They said**: "{user_response}"
-**Your last question**: "{previous_question}"
+        domain = (session_state or {}).get("domain", "technical discussion")
 
-**RULES:**
-1. Talk like a NORMAL person - no weird fancy phrases
-2. Use SIMPLE English that sounds natural
-3. Keep responses SHORT - max 15-20 words each
-4. Sound interested but not fake
-5. Be different each time but stay normal
+        core = f"""
+You are a friendly but technically sharp mentor guiding the user through a {domain} discussion.
 
-**RESPONSE STYLE**: 
-- Normal conversational English
-- Show you're listening to what they said
-- Ask good follow-up questions
-- Don't use weird phrases like "data stew" or "sentence acrobatics"
-- Sound like a real colleague, not a poet
+CONTEXT (Knowledge Source — from actual work summary):
+{context_text[:2000] if context_text else "No summary available. Ask general technical questions."}
 
-**TASK**: 
-1. Decide if their answer is good enough (YES/NO)
-2. Give ONE natural response with next question
+USER JUST SAID:
+"{user_input}"
 
-**FORMAT** (EXACTLY like this):
-UNDERSTANDING: [YES or NO]
-CONCEPT: [{current_concept_title}]
-QUESTION: [Your normal, short response with next question - max 20 words]
+NEXT QUESTION PLAN:
+"{next_question}"
 
-Keep it simple, natural, and conversational. No weird creative phrases."""
+GOAL:
+- Continue a *technical standup* based on the CONTEXT above
+- Ask about SPECIFIC tools, steps, or procedures mentioned in the context
+- If the user answered well → move to the next specific operation from the context
+- If the user was vague → ask a clarifying question about the same topic
+
+STYLE RULES:
+- Natural, human mentor tone — curious but concise
+- One question only (12-20 words)
+- Ask about SPECIFIC technical details from the context
+- Avoid generic questions like "What area do you want to focus on?"
+- Avoid meta language ("Let's talk about..." / "Can you tell me about...")
+- Do not summarize or restate user answers
+- Stay within the context provided
+
+GOOD EXAMPLES (if context mentions SAP kernel upgrade):
+- "After downloading the kernel, what's the verification step before applying it?"
+- "When backing up the kernel directory, which files are most critical?"
+- "What happens if you skip the sapcpe test after kernel extraction?"
+
+BAD EXAMPLES:
+- "What's your experience with kernel upgrades?" (too generic)
+- "Tell me about SAP systems" (off-topic)
+- "Let's discuss technical concepts" (meta language)
+
+OUTPUT:
+Write one short, technically specific question from the context (12-20 words).
+"""
         return _append_boundaries(core)
 
+    # ============================================================================
+    # ✅ UPDATED: Follow-up Response - DIRECT QUIZ STYLE
+    # ============================================================================
     @staticmethod
-    def dynamic_concept_transition(user_response: str, next_question: str, progress_info: Dict) -> str:
-        core = f"""You're moving to a new topic in your chat.
+    def dynamic_followup_response(context_text: str, user_input: str, 
+                                previous_question: str, session_state: dict) -> str:
+        """
+        Generate direct follow-up questions in quiz style.
+        """
+        
+        concept = session_state.get("concept", "the topic")
+        questions_asked = session_state.get("questions_asked", 1)
+        
+        core = f"""
+    You are conducting a technical knowledge check about: {concept}
 
-**They said**: "{user_response}"
-**New topic**: "{progress_info.get('current_concept', 'next thing')}"
-**Next question**: "{next_question}"
+    SUMMARY CONTENT:
+    {context_text[:2000]}
 
-**BE CREATIVE**: Make this transition feel natural and different. Don't use boring standard phrases.
+    PREVIOUS QUESTION: "{previous_question}"
+    USER'S ANSWER: "{user_input}"
+    QUESTIONS ASKED: {questions_asked}/3
 
-Think about:
-- What they just told you
-- How to smoothly shift topics
-- How a real person would change subjects
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ⚠️ CRITICAL: THE ANSWER MUST BE IN THE SUMMARY CONTENT ABOVE ⚠️
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Make it feel like a real conversation where you're genuinely moving from one interesting topic to another.
+    STEP 1 - IDENTIFY A FACT (not an instruction):
+    ✅ FACTS (use these - they have answers):
+    - "RFC enables communication" → FACT
+    - "AI analyzes medical images" → FACT
+    - "Port 3320 is used for target system" → FACT
 
-Max 20 words. Be original every time."""
-        return _append_boundaries(core)
+    ❌ INSTRUCTIONS (ignore these - no answers):
+    - "Identify the problem you want to solve" → INSTRUCTION
+    - "Gather relevant data" → INSTRUCTION
+    - "Define the problem statement" → INSTRUCTION
 
+    STEP 2 - ASK ABOUT A DIFFERENT FACT THAN PREVIOUS QUESTION
+
+    TASK:
+    Generate ONE follow-up question about a DIFFERENT fact from the SAME SUMMARY CONTENT above.
+
+    QUESTION STYLE (Match these exact patterns):
+    - "What is [tool/command] used for?"
+    - "How to [action]?"
+    - "Which [tool/transaction] [does action]?"
+    - "What command [does task]?"
+    - "What is the meaning of [term]?"
+    - "What happens when [scenario]?"
+    - "What does [acronym] stand for?"
+    - "What does [subject] analyze/enable/require?"
+
+    STRICT RULES:
+    1. Ask about a DIFFERENT detail than previous question
+    2. THE ANSWER MUST BE IN SUMMARY CONTENT above
+    3. Length: 10-18 words
+    4. DIRECT style - no conversational phrases
+    5. NO "you/your": "your project", "you are considering", "in your work"
+    6. NO hypotheticals: "what would you", "how would you"
+    7. Ask about specific tools, commands, transactions, ports, steps, facts
+
+    GOOD EXAMPLES:
+
+    SAP Summary:
+    Previous Q: "What is RFC used for?"
+    ✅ Follow-up: "Which transaction code monitors failed RFC calls?"
+
+    Previous Q: "Which transaction applies support packages?"
+    ✅ Follow-up: "What client is used for SPAM operations?"
+
+    AI Summary:
+    Previous Q: "What do AI algorithms analyze?"
+    ✅ Follow-up: "Who does AI assist in diagnosing conditions?" → Answer: "Radiologists"
+
+    Previous Q: "What platforms are used for AI development?"
+    ✅ Follow-up: "What resources are required for AI training?" → Answer: "Computing resources"
+    ❌ Follow-up: "What data is relevant for your project?" → NO ANSWER IN SUMMARY!
+
+    Previous Q: "What are data sets used for?"
+    ✅ Follow-up: "What are the two types of data sets needed?" → Answer: "Training and testing"
+    ❌ Follow-up: "How would you split your data?" → ASKS USER OPINION!
+
+    BAD EXAMPLES (too conversational - NEVER use):
+    ❌ "How do you typically handle this in your environment?"
+    ❌ "What's your experience with this concept?"
+    ❌ "Can you explain more about your approach?"
+    ❌ "What problem are you trying to solve?"
+    ❌ "What tools are you considering?"
+
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    VALIDATION: Before outputting, verify:
+    "Can someone answer this by ONLY reading the SUMMARY CONTENT above?"
+    - YES → Output the question  
+    - NO → Find a different fact and try again
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    NOW GENERATE:
+    One direct follow-up question about "{concept}" from SUMMARY CONTENT (10-18 words, ANSWER IN CONTENT):"""
+
+        return core
+    # ============================================================================
+    # ✅ UPDATED: Concept Transition - DIRECT QUIZ STYLE
+    # ============================================================================
+    @staticmethod
+    def dynamic_concept_transition(current_concept: str, next_concept: str, 
+                                user_last_answer: str, next_concept_content: str) -> str:
+        """
+        Generate direct technical questions WITHOUT transition prefixes.
+        """
+        
+        # Clean up concept titles (remove markdown formatting)
+        next_concept_clean = next_concept.replace('**', '').replace('*', '').strip()
+        if next_concept_clean.endswith(':'):
+            next_concept_clean = next_concept_clean[:-1]
+        
+        core = f"""
+    You are asking technical questions in a natural conversation flow.
+
+    Previous topic: {current_concept}
+    Current topic: {next_concept_clean}
+    User's last answer: {user_last_answer}
+
+    TOPIC CONTENT:
+    {next_concept_content[:1500]}
+
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ⚠️ CRITICAL: THE ANSWER MUST BE IN THE TOPIC CONTENT ABOVE ⚠️
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    STEP 1 - IDENTIFY A FACT (not an instruction):
+    ✅ FACTS (use these - they have answers):
+    - "RFC enables communication between SAP systems" → FACT
+    - "AI algorithms analyze medical images" → FACT
+    - "Transaction SM59 configures connections" → FACT
+    - "TensorFlow is a development platform" → FACT
+
+    ❌ INSTRUCTIONS (ignore these - no answers):
+    - "Identify the specific problem you want to solve" → INSTRUCTION
+    - "Gather relevant data" → INSTRUCTION
+    - "Define the problem statement" → INSTRUCTION
+    - "Choose the right model" → INSTRUCTION
+    - Any sentence that tells you what to DO (imperative verb)
+
+    STEP 2 - TURN THE FACT INTO A QUESTION:
+    Pattern: Summary says "X does Y" → Ask "What does X do?" → Answer: "Y"
+
+    TASK:
+    Generate ONE direct technical question about "{next_concept_clean}" based on a FACT in the content above.
+
+    CRITICAL RULES:
+    1. THE ANSWER MUST BE STATED IN THE TOPIC CONTENT
+    2. DO NOT use transition phrases like "Next topic", "Moving on", "Let's continue"
+    3. Just ask the question directly
+    4. NO "you/your" questions: "what do you want", "in your project", "your experience"
+    5. NO hypotheticals: "what would you", "how would you"
+    6. Keep it 10-15 words
+
+    QUESTION PATTERNS (use these):
+    - "What is [concept] used for?"
+    - "How does [tool] work?"
+    - "Which transaction code handles [task]?"
+    - "What does [acronym] stand for?"
+    - "What are the main components of [system]?"
+    - "What does [subject] analyze/enable/require?"
+
+    GOOD EXAMPLES:
+
+    SAP Summary: "sending system waits for acknowledgment in synchronous RFC"
+    ✅ "In synchronous RFC, does the sending system wait for acknowledgment?"
+
+    SAP Summary: "three methods: Front End, Application Server, EPS Inbox"
+    ✅ "What are the three methods for loading support packages?"
+
+    SAP Summary: "transaction code ST11 for log trace files"
+    ✅ "Which transaction code is used to access RFC error logs?"
+
+    AI Summary: "AI algorithms analyze medical images to detect abnormalities"
+    ✅ "What do AI algorithms analyze in healthcare?" → Answer: "Medical images"
+    ❌ "What problem do you want AI to solve?" → NO ANSWER IN CONTENT!
+
+    AI Summary: "TensorFlow and PyTorch are AI development platforms"
+    ✅ "What are examples of AI development platforms?" → Answer: "TensorFlow, PyTorch"
+    ❌ "What tools are you considering?" → ASKS USER, NOT CONTENT!
+
+    AI Summary: "Computing resources with sufficient processing power are required"
+    ✅ "What resources are required for AI training?" → Answer: "Computing resources"
+    ❌ "What computing resources do you have?" → NO ANSWER IN CONTENT!
+
+    BAD EXAMPLES (NEVER do this):
+    ❌ "Next topic. What is..." (transition phrase)
+    ❌ "Moving on. How does..." (transition phrase)
+    ❌ "What do you want to achieve?" (no answer in content)
+    ❌ "What is your approach to..." (asks user opinion)
+    ❌ "How would you implement..." (hypothetical)
+
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    VALIDATION: Before outputting, verify:
+    "Can someone answer this by ONLY reading the TOPIC CONTENT above?"
+    - YES → Output the question
+    - NO → Find a different fact and try again
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    NOW GENERATE:
+    Ask ONE direct question about "{next_concept_clean}" (10-15 words, NO transition prefix, ANSWER IN CONTENT):"""
+
+        return core
+    # ---------- Fragment evaluation (kept intact) ----------
     @staticmethod
     def dynamic_fragment_evaluation(concepts_covered: List[str], conversation_exchanges: List[Dict],
                                     session_stats: Dict) -> str:
@@ -275,7 +636,7 @@ Max 20 words. Be original every time."""
     FEEDBACK: [short, human, specific feedback]"""
         return _append_boundaries(core)
 
-
+    # ---------- Session completion (kept intact) ----------
     @staticmethod
     def dynamic_session_completion(conversation_summary: Dict, user_final_response: str = None) -> str:
         topics_discussed = conversation_summary.get('topics_covered', [])
@@ -292,7 +653,7 @@ Max 20 words. Be original every time."""
 
     **STYLE**
     - Very short (12–20 words), natural, human.
-    - Must include “Thanks” or “Thank you”.
+    - Must include "Thanks" or "Thank you".
     - No follow-up questions.
     - No bullets, no headings, no extra lines.
 
@@ -300,7 +661,7 @@ Max 20 words. Be original every time."""
     Output exactly ONE sentence only, nothing else."""
         return _append_boundaries(core)
 
-
+    # ---------- Clarification request (kept intact) ----------
     @staticmethod
     def dynamic_clarification_request(context: Dict) -> str:
         attempts = context.get('clarification_attempts', 0)
@@ -319,6 +680,7 @@ Make it:
 One creative sentence. Make it feel real."""
         return _append_boundaries(core)
 
+    # ---------- Gentle conclusion response (kept intact) ----------
     @staticmethod
     def dynamic_conclusion_response(user_input: str, session_context: Dict) -> str:
         core = f"""They just said: "{user_input}"
@@ -335,6 +697,8 @@ Make it:
 
 Max 20 words. Be original every time."""
         return _append_boundaries(core)
+
+    # ---------- OFF-TOPIC redirect (kept intact) ----------
     @staticmethod
     def boundary_offtopic_prompt(topic: str, subtask: str = "") -> str:
         ask = f"What progress since yesterday on {subtask or topic}?"
@@ -349,48 +713,231 @@ Max 20 words. Be original every time."""
     - Never expand on or question the off-topic subject.
     - Always bring the user back to the interview topic."""
         return _append_boundaries(core)
+
+    @staticmethod
+    def generate_main_question_from_content(fragment_details: dict) -> str:
+        """Generate question from specific fragment content."""
+        title = fragment_details.get('title', '')
+        content = fragment_details.get('content', '')
+        key_terms = fragment_details.get('key_terms', [])
+        
+        return f"""
+    You are asking a technical question from this training content:
+
+    SECTION: {title}
+    CONTENT:
+    {content[:1200]}
+
+    KEY TERMS: {', '.join(key_terms[:5]) if key_terms else 'None'}
+
+    TASK: Generate ONE direct question about a SPECIFIC FACT from the CONTENT.
+
+    RULES:
+    1. Question MUST be answerable from CONTENT above
+    2. Ask about FIRST key concept/definition
+    3. Length: 8-15 words
+    4. Use EXACT terms from content
+    5. Pattern: "What is [X] used for?" / "What does [X] do?" / "Which [X] is used for [Y]?"
+
+    EXAMPLES:
+    Content: "RFCs enable communication between SAP systems"
+    → "What do RFCs enable in SAP systems?"
+
+    Content: "Transaction SM59 configures RFC connections"
+    → "What is transaction SM59 used for?"
+
+    Content: "There are four types: aRFC, sRFC, tRFC, qRFC"
+    → "How many types of RFCs are there?"
+
+    Generate ONE question about "{title}":
+    """
+
+    # ADD this new method to DailyStandupPrompts class:
+
+    @staticmethod
+    def generate_example_question(fragment_details: dict, previous_question: str) -> str:
+        """Generate follow-up asking for example."""
+        title = fragment_details.get('title', '')
+        
+        return f"""
+    User just answered a question about: {title}
+    Previous question: "{previous_question}"
+
+    The content has an example for this topic.
+
+    TASK: Ask them to provide an example. Keep it SHORT (max 10 words).
+
+    OUTPUT one of these (or similar):
+    - "Can you give me an example of that?"
+    - "Could you provide an example?"
+    - "What would be a practical example?"
+
+    Generate:
+    """
+
+    # ============================================================================
+    # ✅ NEW: Web-based extended question generation
+    # ============================================================================
+    @staticmethod
+    def generate_extended_web_question(topic: str, already_asked: List[str], summary_context: str) -> str:
+        """
+        Generate additional questions using web knowledge when summary is exhausted.
+        Questions must be related to the topic but NOT repeat anything already asked.
+        """
+        already_asked_text = "\n".join([f"- {q}" for q in already_asked[-15:]]) if already_asked else "None yet"
+        
+        return f"""
+You are conducting a technical knowledge check. The summary-based questions are exhausted, 
+but the session needs to continue. Generate a NEW question about the topic.
+
+TOPIC/DOMAIN: {topic}
+
+SUMMARY CONTEXT (for reference):
+{summary_context[:1500] if summary_context else "General technical discussion"}
+
+QUESTIONS ALREADY ASKED (DO NOT REPEAT THESE):
+{already_asked_text}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ CRITICAL RULES:
+1. Question MUST be about {topic} or closely related concepts
+2. Question MUST NOT repeat or rephrase any already-asked question
+3. Question should test practical knowledge, best practices, or real-world scenarios
+4. Keep it 10-18 words
+5. Use direct quiz-style format
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+QUESTION PATTERNS TO USE:
+- "What is a common issue when [doing X] and how to resolve it?"
+- "What best practice should be followed for [task]?"
+- "What happens if [scenario] occurs in [system]?"
+- "How would you troubleshoot [problem] in [context]?"
+- "What are the prerequisites for [operation]?"
+- "What is the difference between [A] and [B]?"
+- "When should you use [technique/tool]?"
+
+GOOD EXAMPLES for SAP:
+- "What common error occurs when kernel upgrade fails midway?"
+- "How do you verify a transport request was successful?"
+- "What backup should be taken before applying patches?"
+
+GOOD EXAMPLES for AI/ML:
+- "What technique prevents overfitting in neural networks?"
+- "How do you handle class imbalance in datasets?"
+- "What metric is best for evaluating classification models?"
+
+Generate ONE new, non-repetitive question about "{topic}" (10-18 words):"""
+
+    # ============================================================================
+    # ✅ NEW: Formal session closing prompt
+    # ============================================================================
+    @staticmethod
+    def formal_session_closing(session_context: Dict[str, Any]) -> str:
+        """
+        Generate a formal, interview-style closing message for the standup session.
+        """
+        name = session_context.get("name", "")
+        topics_covered = session_context.get("topics_covered", [])
+        total_questions = session_context.get("total_questions", 0)
+        duration = session_context.get("duration_minutes", 15)
+        
+        topics_text = ", ".join(topics_covered[:5]) if topics_covered else "various technical topics"
+        
+        return f"""
+Generate a FORMAL, PROFESSIONAL closing message for this technical standup session.
+
+SESSION SUMMARY:
+- Candidate: {name}
+- Duration: {duration:.1f} minutes
+- Topics Covered: {topics_text}
+- Total Questions: {total_questions}
+
+REQUIREMENTS:
+1. Thank the candidate professionally
+2. Mention this was a productive session
+3. Indicate the session is now complete
+4. Keep it formal but warm (like an interviewer ending an interview)
+5. Maximum 25 words
+6. Do NOT ask any follow-up questions
+
+STYLE EXAMPLES:
+- "Great session, {name}. Thank you for your time today. We've covered good ground. We'll connect again in our next standup."
+- "That concludes our standup for today, {name}. Thank you for walking me through your work. See you in the next session."
+- "Excellent, {name}. That's all for today's standup. I appreciate your responses. We'll reconnect in the next session."
+
+Generate ONE formal closing message (max 25 words):"""
+
+    # ---------- Silence response (kept intact) ----------
     @staticmethod
     def dynamic_silence_response(session_context: Dict) -> str:
-        domain = session_context.get("domain", "your topic")
-        name = session_context.get("name", "")
-        time_of_day = session_context.get("time_of_day", "")
-
-
-        core = f"""The user has been silent for a while in this standup session.
-
-
-        You are the AI standup assistant.
-        Be gentle and encouraging.
-
-
-        - Ask if they are comfortable or okay to continue.
-        - Use very simple and polite language.
-        - Mention you’re ready when they are.
-        - If context available, mention domain or topic briefly.
-        - Keep it short and friendly (max 18 words).
-
-
-        EXAMPLES:
-        - "Are you feeling okay to continue? We can start whenever you're ready."
-        - "If you're comfortable, let's begin with your {domain} update. Just let me know."
-        - "No rush! When you're ready, we can start with {domain}."
-        - "Just checking in—shall we go ahead with {domain}?"
-
-
-        Respond with just ONE line like above, keeping it warm and professional.
         """
-        return _append_boundaries(core)
-    
+        Return HARDCODED silence prompts with slight variations.
+        No LLM generation - just return the text directly.
+        """
+        
+        name = session_context.get("name", "")
+        silence_count = session_context.get("silence_count", 1)
+        
+        # Import random for variation
+        import random
+        
+        # Level 1: Gentle check-in
+        if silence_count == 1:
+            options = [
+                f"{name}, are you there? I'd love to hear from you.?",
+                f"Hey {name},just checking — are you still with me?",
+                f"{name}, are you there? I'm ready whenever you are?",
+            ]
+            return random.choice(options)
+        
+        # Level 2: Connection check
+        elif silence_count == 2:
+            options = [
+                f"Hello? {name}? Can you hear me?",
+                f"{name}, are you still there?",
+                f"{name}, can you hear me? Just checking the connection.",
+            ]
+            return random.choice(options)
+        
+        # Level 3: Offering help
+        elif silence_count == 3:
+            options = [
+                f"Are you still there, {name}? Let me know if you need me to repeat the question",
+                f"{name}, I'm here when you're ready. Need me to repeat anything?",
+                f"Still nothing from your side, {name}. Need me to repeat anything?",
+            ]
+            return random.choice(options)
+        
+        # Level 4: Giving space
+        elif silence_count == 4:
+            options = [
+                f"{name}, I'm still here. Take your time - I'll wait.",
+                f"No rush, {name}. I'll wait - just let me know when you're ready.",
+                f"Still here, {name}. Take all the time you need.",
+            ]
+            return random.choice(options)
+        
+        # Level 5+: Graceful wrap-up
+        else:
+            options = [
+                f"I notice you're not responding, {name}. Let's wrap up for now. We can continue this another time.",
+                f"Seems like you're still silent,{name}. I'll wrap up for now. Catch you later!",
+                f"Haven't heard from you, {name}. I'll end our session now. Thanks!",
+            ]
+            return random.choice(options)
+
+    # ---------- VULGARITY handling (kept intact) ----------
     @staticmethod
     def boundary_vulgar_prompt(topic: str) -> str:
         core = f"User used inappropriate language. Give ONE short warning and restate the topic: {topic}. Do not repeat the language."
         return _append_boundaries(core)
 
+    # ---------- Quick redirect helpers (kept intact) ----------
     @staticmethod
     def off_topic_redirect(topic: str, subtask: str = "") -> str:
         if subtask:
-            return f"Let’s keep this about {topic}. What’s the status of {subtask}?"
-        return f"Let’s keep this about {topic}. What progress did you make since yesterday?"
+            return f"Let's keep this about {topic}. What's the status of {subtask}?"
+        return f"Let's keep this about {topic}. What progress did you make since yesterday?"
 
     @staticmethod
     def off_topic_firm(topic: str, subtask: str = "") -> str:
@@ -400,11 +947,11 @@ Max 20 words. Be original every time."""
 
     @staticmethod
     def off_topic_move_on(next_topic: str) -> str:
-        return f"I’ll move to the next item: {next_topic}. What changed since last update?"
+        return f"I'll move to the next item: {next_topic}. What changed since last update?"
 
     @staticmethod
     def vulgar_warning_1(topic: str) -> str:
-        return f"Let’s keep language respectful. Can you summarize your update on {topic}?"
+        return f"Let's keep language respectful. Can you summarize your update on {topic}?"
 
     @staticmethod
     def vulgar_warning_2(topic: str) -> str:
@@ -412,22 +959,259 @@ Max 20 words. Be original every time."""
 
     @staticmethod
     def end_due_to_vulgarity() -> str:
-        return "I’m ending this standup due to repeated inappropriate language. We can resume when it’s respectful."
+        return "I'm ending this standup due to repeated inappropriate language. We can resume when it's respectful."
 
     @staticmethod
     def refuse_nsfw_and_redirect(topic: str) -> str:
-        return f"I can’t discuss that. Let’s focus on your {topic} update: progress, blockers, next steps?"
+        return f"I can't discuss that. Let's focus on your {topic} update: progress, blockers, next steps?"
 
     @staticmethod
     def harassment_block_and_redirect(topic: str) -> str:
-        return f"That language isn’t okay here. Please share your concrete update on {topic}—progress, blockers, next steps."
-    
+        return f"That language isn't okay here. Please share your concrete update on {topic}—progress, blockers, next steps."
+
+    # ---------- NEW: auto-advance helper ----------
+    @staticmethod
+    def dynamic_auto_advance(ctx: Dict[str, Any]) -> str:
+        current_topic = ctx.get("current_topic", "your work")
+        next_topic = ctx.get("next_topic", "the next item")
+        name = ctx.get("name", "")
+        core = f"""User remained silent or was unclear.
+
+TASK:
+- Move forward politely in ≤18 words.
+Examples:
+"Alright {name}, let's move on to {next_topic}."
+"Let's continue with {next_topic}, {name}."
+"""
+        return _append_boundaries(core)
+
+    # ---------- NEW: hard cutoff closure helper ----------
+    @staticmethod
+    def dynamic_hardcutoff_closure(summary: Dict[str, Any]) -> str:
+        topics = ", ".join(summary.get("topics_covered", [])) or "various topics"
+        name = summary.get("name", "participant")
+        core = f"""Time limit reached.
+
+Topics covered: {topics}
+
+TASK:
+- Close politely in ≤18 words with thanks.
+Examples:
+"Thanks {name}, we're out of time but this was productive."
+"Appreciate it {name}; we'll continue next time."
+"""
+        return _append_boundaries(core)
+
+# =============================================================================
+# ADD THIS TO YOUR prompts.py FILE - COMPREHENSIVE EVALUATION PROMPTS
+# =============================================================================
+    @staticmethod
+    def comprehensive_evaluation_prompt(session_data: dict) -> str:
+        """
+        Generate a comprehensive evaluation prompt for the LLM to analyze
+        the entire standup session and provide detailed feedback.
+        """
+        
+        conversation_text = ""
+        for idx, exchange in enumerate(session_data.get("conversation", []), 1):
+            q = exchange.get("question", "")
+            a = exchange.get("answer", "")
+            response_type = exchange.get("response_type", "answered")
+            concept = exchange.get("concept", "unknown")
+            
+            conversation_text += f"""
+    Question {idx} (Concept: {concept}):
+    Q: {q}
+    A: {a}
+    Response Type: {response_type}
+    ---
+    """
+        
+        stats = session_data.get("stats", {})
+        
+        prompt = f"""You are an expert technical interviewer evaluating a candidate's performance in a Daily Standup assessment.
+
+    ## Session Information
+    - Candidate Name: {session_data.get("student_name", "Unknown")}
+    - Duration: {session_data.get("duration_minutes", 0):.1f} minutes
+    - Total Questions Asked: {stats.get("total_questions", 0)}
+    - Questions Answered: {stats.get("answered_count", 0)}
+    - Questions Skipped: {stats.get("skipped_count", 0)}
+    - Silent Responses: {stats.get("silent_count", 0)}
+    - Irrelevant Answers: {stats.get("irrelevant_count", 0)}
+    - Repeat Requests: {stats.get("repeat_requests_count", 0)}
+
+    ## Conversation Log
+    {conversation_text}
+
+    ## Your Task
+    Analyze this standup session and provide a COMPREHENSIVE evaluation in the following JSON format:
+
+    {{
+        "overall_score": <number 0-100>,
+        "technical_score": <number 0-100>,
+        "communication_score": <number 0-100>,
+        "attentiveness_score": <number 0-100>,
+        
+        "grade": "<A+/A/A-/B+/B/B-/C+/C/C-/D/F>",
+        
+        "summary": "<2-3 sentence overall summary>",
+        
+        "strengths": [
+            "<strength 1>",
+            "<strength 2>",
+            "<strength 3>"
+        ],
+        
+        "weaknesses": [
+            "<weakness 1>",
+            "<weakness 2>"
+        ],
+        
+        "areas_for_improvement": [
+            "<specific actionable improvement 1>",
+            "<specific actionable improvement 2>",
+            "<specific actionable improvement 3>"
+        ],
+        
+        "question_analysis": [
+            {{
+                "question_number": 1,
+                "question": "<the question>",
+                "answer": "<the answer>",
+                "concept": "<concept tested>",
+                "evaluation": "correct|partial|incorrect|skipped|irrelevant|silent",
+                "score": <0-10>,
+                "feedback": "<specific feedback for this answer>"
+            }}
+        ],
+        
+        "attentiveness_analysis": {{
+            "engagement_level": "<High/Medium/Low>",
+            "response_consistency": "<Consistent/Inconsistent>",
+            "focus_areas": "<areas where candidate showed good focus>",
+            "distraction_indicators": "<any signs of distraction or disengagement>"
+        }},
+        
+        "recommendations": [
+            "<recommendation 1>",
+            "<recommendation 2>",
+            "<recommendation 3>"
+        ],
+        
+        "topics_mastered": ["<topic 1>", "<topic 2>"],
+        "topics_to_review": ["<topic 1>", "<topic 2>"]
+    }}
+
+    ## Evaluation Guidelines:
+    1. **Correct Answer**: Full understanding demonstrated, accurate response (8-10 points)
+    2. **Partial Answer**: Some understanding but incomplete or minor errors (4-7 points)
+    3. **Incorrect Answer**: Wrong or significantly flawed response (1-3 points)
+    4. **Skipped**: Candidate explicitly skipped the question (0 points)
+    5. **Irrelevant**: Answer was off-topic or unrelated (0 points)
+    6. **Silent**: No response provided (0 points)
+
+    ## Attentiveness Scoring:
+    - High attentiveness: Minimal skips, no irrelevant answers, quick responses
+    - Medium attentiveness: Some skips or delays, mostly engaged
+    - Low attentiveness: Multiple silences, irrelevant answers, frequent repeat requests
+
+    Respond ONLY with the JSON object, no additional text.
+    """
+        return prompt
+
+    @staticmethod
+    def per_question_evaluation_prompt(question: str, answer: str, concept: str, response_type: str) -> str:
+        """
+        Generate a prompt for evaluating a single Q&A pair.
+        """
+        prompt = f"""Evaluate this technical Q&A from a standup assessment:
+
+    **Concept Being Tested:** {concept}
+    **Question:** {question}
+    **Candidate's Answer:** {answer}
+    **Response Type:** {response_type}
+
+    Provide evaluation in this exact JSON format:
+    {{
+        "is_correct": <true/false>,
+        "correctness_level": "<correct|partial|incorrect|skipped|irrelevant|silent>",
+        "score": <0-10>,
+        "key_points_covered": ["<point1>", "<point2>"],
+        "key_points_missed": ["<point1>", "<point2>"],
+        "feedback": "<specific constructive feedback, max 2 sentences>"
+    }}
+
+    Scoring guide:
+    - 9-10: Excellent, comprehensive answer
+    - 7-8: Good answer with minor gaps
+    - 5-6: Acceptable but incomplete
+    - 3-4: Poor understanding shown
+    - 1-2: Very weak response
+    - 0: No answer/irrelevant/skipped
+
+    Respond ONLY with JSON.
+    """
+        return prompt
+
+    @staticmethod
+    def generate_strengths_weaknesses_prompt(evaluated_questions: list, stats: dict) -> str:
+        """
+        Generate a prompt to analyze strengths and weaknesses from evaluated questions.
+        """
+        questions_summary = ""
+        for q in evaluated_questions:
+            questions_summary += f"- {q.get('concept', 'Unknown')}: Score {q.get('score', 0)}/10 ({q.get('correctness_level', 'unknown')})\n"
+        
+        prompt = f"""Based on this standup performance summary, identify strengths and weaknesses:
+
+    ## Performance by Concept:
+    {questions_summary}
+
+    ## Statistics:
+    - Answered: {stats.get('answered_count', 0)}
+    - Skipped: {stats.get('skipped_count', 0)}
+    - Silent: {stats.get('silent_count', 0)}
+    - Irrelevant: {stats.get('irrelevant_count', 0)}
+
+    Provide analysis in JSON format:
+    {{
+        "strengths": [
+            {{"area": "<strength area>", "evidence": "<why this is a strength>"}},
+            {{"area": "<strength area>", "evidence": "<why this is a strength>"}}
+        ],
+        "weaknesses": [
+            {{"area": "<weakness area>", "evidence": "<why this is a weakness>", "improvement_tip": "<how to improve>"}},
+            {{"area": "<weakness area>", "evidence": "<why this is a weakness>", "improvement_tip": "<how to improve>"}}
+        ],
+        "top_performing_topics": ["<topic1>", "<topic2>"],
+        "needs_improvement_topics": ["<topic1>", "<topic2>"]
+    }}
+
+    Respond ONLY with JSON.
+    """
+        return prompt
+
+
 # Backward compatibility aliases for daily_standup:
 Prompts = DailyStandupPrompts
 prompts = DailyStandupPrompts()
 
+# Module-level function wrappers for evaluation prompts
+def comprehensive_evaluation_prompt(session_data: dict) -> str:
+    """Module-level wrapper for comprehensive evaluation prompt."""
+    return DailyStandupPrompts.comprehensive_evaluation_prompt(session_data)
+
+def per_question_evaluation_prompt(question: str, answer: str, concept: str, response_type: str) -> str:
+    """Module-level wrapper for per-question evaluation prompt."""
+    return DailyStandupPrompts.per_question_evaluation_prompt(question, answer, concept, response_type)
+
+def generate_strengths_weaknesses_prompt(evaluated_questions: list, stats: dict) -> str:
+    """Module-level wrapper for strengths/weaknesses prompt."""
+    return DailyStandupPrompts.generate_strengths_weaknesses_prompt(evaluated_questions, stats)
+
 # =============================================================================
-# WEEKEND MOCKTEST PROMPTS  (unchanged public API)
+# WEEKEND MOCKTEST PROMPTS  (unchanged - keeping all existing code)
 # =============================================================================
 
 class PromptTemplates:
@@ -717,7 +1501,7 @@ class PromptValidator:
         return validation
 
 # =============================================================================
-# WEEKLY INTERVIEW PROMPTS (unchanged public API)
+# WEEKLY INTERVIEW PROMPTS (unchanged - keeping all existing code)
 # =============================================================================
 
 SYSTEM_CONTEXT_BASE = """You are Sarah, an experienced senior technical interviewer at a leading tech company. You have 8+ years of experience conducting interviews and are known for your warm yet professional approach. You make candidates feel comfortable while thoroughly assessing their skills.
@@ -1041,6 +1825,9 @@ validate_prompts()
 __all__ = [
     # Daily standup
     "DailyStandupPrompts", "Prompts", "prompts",
+    "comprehensive_evaluation_prompt",
+    "per_question_evaluation_prompt",
+    "generate_strengths_weaknesses_prompt",
     # Weekend mocktest
     "PromptTemplates", "PromptValidator",
     # Weekly interview

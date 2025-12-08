@@ -441,14 +441,14 @@ ENV DEBUG_MODE=false
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:8090/health || exit 1
+  CMD curl -f http://localhost:8030/health || exit 1
 
 # Non-root user for security
 RUN adduser --disabled-password --gecos '' appuser
 USER appuser
 
-EXPOSE 8090
-CMD ["uvicorn", "weekend_mocktest.main:app", "--host", "0.0.0.0", "--port", "8090", "--workers", "4"]
+EXPOSE 8030
+CMD ["uvicorn", "weekend_mocktest.main:app", "--host", "0.0.0.0", "--port", "8030", "--workers", "4"]
 ```
 
 ### **Production Scaling Strategy**
@@ -462,12 +462,12 @@ services:
     image: tmps-api:production
     replicas: 3
     ports:
-      - "8090-8062:8090"
+      - "8030-8062:8030"
     environment:
       - LOG_LEVEL=INFO
       - MAX_WORKERS=4
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8030/health"]
       interval: 30s
       timeout: 10s
       retries: 3

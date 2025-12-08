@@ -3,6 +3,7 @@
 # - Keeps weekend_mocktest API names intact (AIService, get_ai_service)
 # - Namespaces overlapping classes for daily_standup (DS_*) and weekly_interview (WI_*)
 # - No functionality removed
+# ✅ FIXED: Added conversation_log field to DS_SessionData for REPEAT and IRRELEVANT features
 
 import os
 import time
@@ -108,6 +109,7 @@ class DS_SessionData:
     current_stage: DS_SessionStage
     exchanges: List[DS_ConversationExchange] = field(default_factory=list)
     conversation_window: deque = field(default_factory=lambda: deque(maxlen=config.CONVERSATION_WINDOW_SIZE))
+    conversation_log: List[Dict[str, Any]] = field(default_factory=list)  # ✅ NEW: For repeat/irrelevant features
     greeting_count: int = 0
     is_active: bool = True
     websocket: Optional[Any] = field(default=None)
@@ -124,23 +126,38 @@ class DS_SessionData:
     followup_questions: int = 0
 
     def add_exchange(self, ai_message: str, user_response: str, quality: float = 0.0,
-                     chunk_id: Optional[int] = None, concept: Optional[str] = None,
-                     is_followup: bool = False):
+                    concept: Optional[str] = None, is_followup: bool = False):
+        """Add exchange to conversation log with concept tracking"""
+        # Create exchange object
         ex = DS_ConversationExchange(
             timestamp=time.time(),
             stage=self.current_stage,
             ai_message=ai_message,
             user_response=user_response,
             transcript_quality=quality,
-            chunk_id=chunk_id,
-            concept=concept,
+            chunk_id=None,  # ✅ Legacy field - always None now
+            concept=concept,  # ✅ Now in the correct slot!
             is_followup=is_followup
         )
         self.exchanges.append(ex)
         self.conversation_window.append(ex)
+        
+        # ✅ ALSO add to conversation_log for repeat/irrelevant features
+        conversation_entry = {
+            "timestamp": time.time(),
+            "stage": self.current_stage.value,
+            "ai_message": ai_message,
+            "user_response": user_response,
+            "quality": quality,
+            "concept": concept,  # ✅ Store concept correctly!
+            "is_followup": is_followup
+        }
+        self.conversation_log.append(conversation_entry)
+        
         self.last_activity = time.time()
-
-
+        
+        # ✅ Debug logging
+        logger.info(f"✅ Exchange added - Concept: '{concept}', Is followup: {is_followup}")   
 @dataclass
 class DS_SummaryChunk:
     id: int
@@ -168,7 +185,7 @@ class DS_SharedClientManager:
             logger.info("[DS] Groq client initialized")
         return self._groq_client
 
-    @property
+    @property 
     def openai_client(self) -> openai_sync.OpenAI:
         if self._openai_client is None:
             api_key = os.getenv("OPENAI_API_KEY")
@@ -190,96 +207,218 @@ class DS_SharedClientManager:
 # global DS shared clients
 ds_shared_clients = DS_SharedClientManager()
 
-
-class DS_FragmentManager:
-    """Daily-standup dynamic fragment manager"""
-    def __init__(self, client_manager: DS_SharedClientManager, session_data: DS_SessionData):
-        self.client_manager = client_manager
+class DS_SummaryManager:
+    """
+    IMPROVED: Line-by-line summary parsing with example detection.
+    """
+    
+    def __init__(self, shared_clients, session_data=None):
+        self.shared_clients = shared_clients
         self.session_data = session_data
-
-    @property
-    def openai_client(self):
-        return self.client_manager.openai_client
-
-    def initialize_fragments(self, summary: str) -> bool:
-        self.session_data.fragments = _ds_parse_summary_into_fragments(summary)
-        self.session_data.fragment_keys = list(self.session_data.fragments.keys())
-        self.session_data.concept_question_counts = {k: 0 for k in self.session_data.fragment_keys}
-        self.session_data.questions_per_concept = max(
-            config.MIN_QUESTIONS_PER_CONCEPT,
-            min(config.MAX_QUESTIONS_PER_CONCEPT,
-                config.TOTAL_QUESTIONS // len(self.session_data.fragment_keys) if self.session_data.fragment_keys else 1)
-        )
-        logger.info(f"[DS] Initialized {len(self.session_data.fragment_keys)} fragments, "
-                    f"target {self.session_data.questions_per_concept}/concept")
-        return True
-
-    def get_active_fragment(self) -> Tuple[str, str]:
-        if not self.session_data.fragment_keys:
-            return "General", self.session_data.fragments.get("General", "No content available")
-        min_q = min(self.session_data.concept_question_counts.values())
-        under = [c for c, cnt in self.session_data.concept_question_counts.items() if cnt == min_q]
-        if under:
-            for c in self.session_data.fragment_keys:
-                if c in under:
-                    return c, self.session_data.fragments[c]
-        idx = self.session_data.question_index % len(self.session_data.fragment_keys)
-        c = self.session_data.fragment_keys[idx]
-        return c, self.session_data.fragments[c]
-
-    def should_continue_test(self) -> bool:
-        actual = len([ex for ex in self.session_data.exchanges if ex.concept and not ex.concept.startswith('greeting')])
-        if actual == 0:
-            return True
-        if any(cnt == 0 for cnt in self.session_data.concept_question_counts.values()):
-            return True
-        underdev = [c for c, cnt in self.session_data.concept_question_counts.items()
-                    if cnt < self.session_data.questions_per_concept]
-        if len(underdev) > len(self.session_data.fragment_keys) * 0.3:
-            return True
-        hard_limit = config.TOTAL_QUESTIONS + (config.TOTAL_QUESTIONS // 2)
-        if actual >= hard_limit:
-            return False
-        if actual >= config.TOTAL_QUESTIONS:
-            mx = max(self.session_data.concept_question_counts.values())
-            mn = min(self.session_data.concept_question_counts.values())
-            if mx - mn <= 1:
+        self.fragments = []  # List of parsed content units
+        self.current_fragment_index = 0
+        self.questions_asked_on_current = 0
+        self.current_topic = ""
+        self.exchange_log = []
+        self.total_questions_asked = 0
+        
+    def initialize_fragments(self, summary_text: str) -> bool:
+        """Parse summary into ordered content units with example detection."""
+        try:
+            if not summary_text or len(summary_text.strip()) < 50:
                 return False
-        return True
-
-    def get_concept_conversation_history(self, concept: str, window_size: int = 5) -> str:
-        entries = [ex for ex in reversed(self.session_data.exchanges) if ex.concept == concept and ex.user_response]
-        last_entries = list(reversed(entries[:window_size]))
-        blocks = []
-        for e in last_entries:
-            blocks.append(f"Q: {e.ai_message}\nA: {e.user_response}")
-        return "\n\n".join(blocks)
-
-    def add_question(self, question: str, concept: str = None, is_followup: bool = False):
-        if concept and concept in self.session_data.concept_question_counts and not concept.startswith('greeting'):
-            self.session_data.concept_question_counts[concept] += 1
-        if is_followup and concept and not concept.startswith('greeting'):
-            self.session_data.followup_questions += 1
-        self.session_data.current_concept = concept or ""
-        if concept and not concept.startswith('greeting'):
-            self.session_data.question_index += 1
-
-    def add_answer(self, answer: str):
-        if self.session_data.exchanges:
-            self.session_data.exchanges[-1].user_response = answer
-
-    def get_progress_info(self) -> Dict[str, Any]:
-        return {
-            "current_question": self.session_data.question_index,
-            "total_concepts": len(self.session_data.fragment_keys),
-            "concept_coverage": self.session_data.concept_question_counts,
-            "questions_per_concept_target": self.session_data.questions_per_concept,
-            "followup_questions": self.session_data.followup_questions,
-            "main_questions": self.session_data.question_index - self.session_data.followup_questions
+            
+            self.fragments = self._parse_summary_structured(summary_text)
+            
+            if not self.fragments:
+                return False
+            
+            # Set topic from first line
+            first_line = summary_text.strip().split('\n')[0]
+            self.current_topic = first_line[:50].replace('#', '').strip()
+            
+            # Update session
+            if self.session_data:
+                self.session_data.fragment_keys = list(range(len(self.fragments)))
+                self.session_data.current_concept = self.fragments[0]['title']
+            
+            logger.info(f"[DS] Parsed summary into {len(self.fragments)} fragments: {[f['title'][:30] for f in self.fragments]}")
+            logger.info(f"[DS] Initialized {len(self.fragments)} fragments, target 1/concept")
+            
+            return True
+        except Exception as e:
+            logger.error(f"[DS] Fragment init error: {e}")
+            return False
+    
+    def _parse_summary_structured(self, text: str) -> list:
+        """Parse summary maintaining structure and detecting examples."""
+        import re
+        
+        fragments = []
+        lines = text.strip().split('\n')
+        
+        current = {
+            'title': 'Introduction',
+            'content': '',
+            'has_example': False,
+            'example_content': '',
+            'key_terms': []
         }
-
-# Back-compat alias (original daily_standup name)
-DS_SummaryManager = DS_FragmentManager
+        
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+            
+            if not line_stripped:
+                continue
+            
+            # Check if this is a header
+            is_header = (
+                line_stripped.startswith('#') or
+                re.match(r'^\d+\.?\d*\.?\s+\w', line_stripped) or
+                (line_stripped.endswith(':') and len(line_stripped.split()) <= 6)
+            )
+            
+            if is_header:
+                # Save current fragment if has content
+                if current['content'].strip():
+                    current['has_example'] = self._check_for_example(current['content'])
+                    current['key_terms'] = self._extract_terms(current['content'])
+                    fragments.append(current.copy())
+                
+                # Start new fragment
+                title = re.sub(r'^#+\s*', '', line_stripped)
+                title = re.sub(r'^\d+\.?\d*\.?\s*', '', title)
+                title = title.rstrip(':')
+                
+                current = {
+                    'title': title,
+                    'content': '',
+                    'has_example': False,
+                    'example_content': '',
+                    'key_terms': []
+                }
+            else:
+                current['content'] += line_stripped + '\n'
+                
+                # Check for inline example
+                if self._is_example_line(line_stripped):
+                    current['example_content'] += line_stripped + '\n'
+        
+        # Don't forget last fragment
+        if current['content'].strip() or current['title']:
+            current['has_example'] = self._check_for_example(current['content'])
+            current['key_terms'] = self._extract_terms(current['content'])
+            fragments.append(current)
+        
+        return fragments
+    
+    def _check_for_example(self, content: str) -> bool:
+        """Check if content contains an example."""
+        patterns = [
+            r'example\s*[:\-–]',
+            r'for example',
+            r'e\.g\.',
+            r'such as:',
+            r'Example –',
+            r'Generated Example',
+            r'#### Example'
+        ]
+        import re
+        for pattern in patterns:
+            if re.search(pattern, content, re.IGNORECASE):
+                return True
+        return False
+    
+    def _is_example_line(self, line: str) -> bool:
+        """Check if specific line is an example."""
+        lower = line.lower()
+        return 'example' in lower or 'e.g.' in lower
+    
+    def _extract_terms(self, content: str) -> list:
+        """Extract technical terms from content."""
+        import re
+        terms = []
+        
+        # Transaction codes
+        terms.extend(re.findall(r'\b[A-Z]{2,4}\d{2,3}\b', content))
+        # Acronyms in parens
+        terms.extend(re.findall(r'\(([A-Z]{2,6})\)', content))
+        # Tech terms
+        terms.extend(re.findall(r'\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b', content))
+        
+        return list(set(terms))[:10]
+    
+    def get_active_fragment(self) -> tuple:
+        """Get current fragment (title, content)."""
+        if not self.fragments or self.current_fragment_index >= len(self.fragments):
+            return ("", "")
+        frag = self.fragments[self.current_fragment_index]
+        return (frag['title'], frag['content'])
+    
+    def get_current_fragment_details(self) -> dict:
+        """Get full details including example info."""
+        if not self.fragments or self.current_fragment_index >= len(self.fragments):
+            return {}
+        
+        frag = self.fragments[self.current_fragment_index]
+        return {
+            'title': frag['title'],
+            'content': frag['content'],
+            'has_example': frag.get('has_example', False),
+            'example_content': frag.get('example_content', ''),
+            'key_terms': frag.get('key_terms', []),
+            'index': self.current_fragment_index,
+            'total': len(self.fragments)
+        }
+    
+    def should_ask_for_example(self) -> bool:
+        """Check if we should ask for example."""
+        if not self.fragments or self.current_fragment_index >= len(self.fragments):
+            return False
+        
+        frag = self.fragments[self.current_fragment_index]
+        # Ask for example after main question if example exists
+        return frag.get('has_example', False) and self.questions_asked_on_current == 1
+    
+    def advance_fragment(self) -> bool:
+        """Move to next fragment."""
+        self.current_fragment_index += 1
+        self.questions_asked_on_current = 0
+        
+        if self.current_fragment_index >= len(self.fragments):
+            logger.info("[DS] All concepts have been covered - no more fragments to advance to")
+            return False
+        
+        new_frag = self.fragments[self.current_fragment_index]
+        logger.info(f"[DS] Advanced to concept: '{new_frag['title']}' (questions: 0/1)")
+        
+        if self.session_data:
+            self.session_data.current_concept = new_frag['title']
+        
+        return True
+    
+    def add_question(self, question: str, concept: str, is_followup: bool = False):
+        """Track asked question."""
+        self.questions_asked_on_current += 1
+        self.total_questions_asked += 1
+        
+        self.exchange_log.append({
+            'question': question,
+            'concept': concept,
+            'is_followup': is_followup,
+            'fragment_index': self.current_fragment_index
+        })
+        
+        logger.info(f"✅ Exchange added - Concept: '{concept}', Is followup: {is_followup}")
+    
+    def add_answer(self, answer: str):
+        """Track answer."""
+        if self.exchange_log:
+            self.exchange_log[-1]['answer'] = answer
+    
+    def should_continue_test(self) -> bool:
+        """Check if more fragments to cover."""
+        return self.current_fragment_index < len(self.fragments)
 
 
 class DS_OptimizedAudioProcessor:
@@ -439,47 +578,334 @@ class DS_OptimizedConversationManager:
             logger.error(f"[DS] Response generation error: {e}")
             raise Exception(f"AI response generation failed: {e}")
 
-    async def generate_fast_evaluation(self, session_data: DS_SessionData) -> Tuple[str, float]:
+    
+    async def generate_fast_evaluation(self, session_data) -> Tuple[str, float, dict]:
+        """
+        Enhanced evaluation that provides comprehensive analysis.
+        Returns: (evaluation_text, score, detailed_evaluation_dict)
+        """
         try:
-            conv = []
-            for ex in session_data.exchanges[-10:]:
-                if ex.stage == DS_SessionStage.TECHNICAL:
-                    conv.append({
-                        'ai_message': ex.ai_message,
-                        'user_response': ex.user_response,
-                        'chunk_id': ex.chunk_id,
-                        'quality': ex.transcript_quality,
-                        'concept': ex.concept,
-                        'is_followup': ex.is_followup
-                    })
-            if not conv:
-                raise Exception("No technical exchanges found for evaluation")
+            # Get conversation_log for processing
+            conversation_log = getattr(session_data, "conversation_log", [])
+            
+            if not conversation_log:
+                raise Exception("No conversation data found for evaluation")
+            
+            logger.info(f"📊 Evaluation: Processing {len(conversation_log)} conversation entries")
+            
+            # ✅ FIXED: Build correctly paired Q&A using the SAME logic as MongoDB save
+            # The conversation_log stores: AI message at index i, user's answer at index i+1
+            paired_exchanges = []
             stats = {
                 'duration_minutes': round((time.time() - session_data.created_at) / 60, 1),
-                'avg_response_length': sum(len(x['user_response']) for x in conv) // len(conv),
-                'total_concepts': len(session_data.fragment_keys),
-                'concepts_covered': len([c for c, cnt in session_data.concept_question_counts.items() if cnt > 0]),
-                'coverage_percentage': round(
-                    (len([c for c, cnt in session_data.concept_question_counts.items() if cnt > 0]) /
-                     max(len(session_data.fragment_keys), 1) * 100), 1
-                ),
-                'main_questions': session_data.question_index - session_data.followup_questions,
-                'followup_questions': session_data.followup_questions,
-                'questions_per_concept': dict(session_data.concept_question_counts)
+                'total_questions': 0,
+                'answered_count': 0,
+                'skipped_count': 0,
+                'silent_count': 0,
+                'irrelevant_count': 0,
+                'repeat_requests_count': 0,
+                'auto_advanced_count': 0
             }
-            covered = [c for c, cnt in session_data.concept_question_counts.items() if cnt > 0]
-            prompt = ds_prompts.dynamic_fragment_evaluation(covered, conv, stats)
+            
+            for idx in range(len(conversation_log)):
+                entry = conversation_log[idx]
+                
+                ai_message = entry.get("ai_message", "")
+                stage = entry.get("stage", "unknown")
+                concept = entry.get("concept", "unknown")
+                is_followup = entry.get("is_followup", False)
+                
+                # Skip if no AI message or too short
+                if not ai_message or len(ai_message.strip()) < 10:
+                    continue
+                
+                # Skip greetings for technical evaluation
+                if stage == "greeting":
+                    continue
+                
+                # Skip silence prompt messages (not real questions)
+                ai_msg_lower = ai_message.lower()
+                silence_prompt_phrases = [
+                    "are you there", "still with me", "can you hear", 
+                    "are you still", "hello?", "you there", "are you ready",
+                    "just checking", "i'd love to hear", "take your time",
+                    "need me to repeat"
+                ]
+                if any(phrase in ai_msg_lower for phrase in silence_prompt_phrases):
+                    continue
+                
+                # ✅ GET ANSWER FROM NEXT EXCHANGE (this is the fix!)
+                user_answer = ""
+                quality_score = 0.0
+                
+                if idx + 1 < len(conversation_log):
+                    next_entry = conversation_log[idx + 1]
+                    user_answer = next_entry.get("user_response", "")
+                    quality_score = next_entry.get("quality", 0.0)
+                else:
+                    user_answer = "(Session ended - no answer)"
+                
+                # Skip placeholder answers
+                if user_answer == "(session_start)":
+                    continue
+                
+                # Determine response type
+                response_type = "answered"
+                
+                if not user_answer or user_answer.strip() == "":
+                    response_type = "no_response"
+                elif user_answer == "(Session ended - no answer)":
+                    response_type = "session_ended"
+                elif user_answer == "[USER_SILENT]":
+                    response_type = "silent"
+                    stats['silent_count'] += 1
+                elif user_answer == "[AUTO_ADVANCE]":
+                    response_type = "auto_advance"
+                    stats['auto_advanced_count'] += 1
+                elif user_answer == "[SKIP]":
+                    response_type = "skipped"
+                    stats['skipped_count'] += 1
+                elif user_answer == "[IRRELEVANT]":
+                    response_type = "irrelevant"
+                    stats['irrelevant_count'] += 1
+                else:
+                    lower = user_answer.lower()
+                    if any(p in lower for p in ["repeat", "again", "what did you", "didn't hear", "pardon", "can you repeat", "say that again"]):
+                        response_type = "repeat_request"
+                        stats['repeat_requests_count'] += 1
+                    else:
+                        response_type = "answered"
+                        stats['answered_count'] += 1
+                
+                # Only include technical questions in evaluation
+                stats['total_questions'] += 1
+                paired_exchanges.append({
+                    "question": ai_message,
+                    "answer": user_answer if response_type == "answered" else f"[{response_type.upper()}]",
+                    "response_type": response_type,
+                    "concept": concept,
+                    "quality_score": quality_score,
+                    "is_followup": is_followup
+                })
+            
+            logger.info(f"📊 Evaluation: Paired {len(paired_exchanges)} Q&A exchanges")
+            logger.info(f"📊 Stats: answered={stats['answered_count']}, silent={stats['silent_count']}, skipped={stats['skipped_count']}, irrelevant={stats['irrelevant_count']}")
+            
+            # Log first few pairs for debugging
+            for i, pair in enumerate(paired_exchanges[:3]):
+                logger.info(f"📊 Pair {i+1}: Q='{pair['question'][:50]}...' A='{pair['answer'][:50]}...'")
+            
+            if not paired_exchanges:
+                raise Exception("No technical exchanges found for evaluation")
+            
+            # Use paired_exchanges for evaluation
+            conversation_for_eval = paired_exchanges
+            # Build comprehensive evaluation session data
+            eval_session_data = {
+                "student_name": session_data.student_name,
+                "duration_minutes": stats['duration_minutes'],
+                "conversation": conversation_for_eval,
+                "stats": stats
+            }
+            
+            # Import the comprehensive evaluation prompt
+            from core.prompts import comprehensive_evaluation_prompt
+            
+            eval_prompt = comprehensive_evaluation_prompt(eval_session_data)
+            
+            # Call LLM for comprehensive evaluation
             loop = asyncio.get_event_loop()
-            evaluation = await loop.run_in_executor(ds_shared_clients.executor, self._sync_openai_call, prompt)
-            m = re.search(r'Score:\s*(\d+(?:\.\d+)?)/10', evaluation)
-            if not m:
-                raise Exception(f"Could not extract score from evaluation text")
-            score = float(m.group(1))
-            return evaluation, score
+            eval_response = await loop.run_in_executor(
+                self.client_manager.executor,
+                self._sync_openai_call,
+                eval_prompt,
+            )
+            
+            # Parse JSON response
+            detailed_evaluation = None
+            try:
+                # Clean up response - remove markdown code blocks if present
+                clean_response = eval_response.strip()
+                if clean_response.startswith("```json"):
+                    clean_response = clean_response[7:]
+                if clean_response.startswith("```"):
+                    clean_response = clean_response[3:]
+                if clean_response.endswith("```"):
+                    clean_response = clean_response[:-3]
+                clean_response = clean_response.strip()
+                
+                detailed_evaluation = json.loads(clean_response)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse evaluation JSON: {e}")
+                logger.error(f"Response was: {eval_response[:500]}")
+                # Create a fallback evaluation
+                detailed_evaluation = self._create_fallback_evaluation(stats, conversation_for_eval)
+            
+            # Extract overall score
+            overall_score = detailed_evaluation.get("overall_score", 70)
+            
+            # Generate human-readable evaluation text
+            evaluation_text = self._format_evaluation_text(detailed_evaluation)
+            
+            # Add raw stats to detailed evaluation
+            detailed_evaluation["raw_stats"] = stats
+            detailed_evaluation["session_info"] = {
+                "session_id": session_data.session_id,
+                "test_id": session_data.test_id,
+                "student_id": session_data.student_id,
+                "student_name": session_data.student_name,
+                "duration_minutes": stats['duration_minutes']
+            }
+            
+            return evaluation_text, overall_score, detailed_evaluation
+            
         except Exception as e:
-            logger.error(f"[DS] Evaluation error: {e}")
-            raise Exception(f"Evaluation generation failed: {e}")
+            logger.error(f"[DS] Comprehensive evaluation error: {e}")
+            import traceback
+            traceback.print_exc()
+            # Return basic evaluation on error
+            return "Evaluation could not be completed due to an error.", 50.0, {
+                "error": str(e),
+                "overall_score": 50,
+                "summary": "Evaluation encountered an error"
+            }
 
+
+    def _create_fallback_evaluation(self, stats: dict, conversation: list) -> dict:
+        """Create a basic evaluation when LLM parsing fails."""
+        
+        total = stats.get('total_questions', 1) or 1
+        answered = stats.get('answered_count', 0)
+        
+        # Calculate basic score
+        answer_rate = (answered / total) * 100 if total > 0 else 0
+        base_score = min(100, max(0, answer_rate))
+        
+        # Penalties
+        penalty = (stats.get('skipped_count', 0) * 5 +
+                stats.get('silent_count', 0) * 3 +
+                stats.get('irrelevant_count', 0) * 7)
+        
+        final_score = max(30, base_score - penalty)
+        
+        # Determine grade
+        if final_score >= 90: grade = "A"
+        elif final_score >= 80: grade = "B"
+        elif final_score >= 70: grade = "C"
+        elif final_score >= 60: grade = "D"
+        else: grade = "F"
+        
+        # Build question analysis
+        question_analysis = []
+        for i, q in enumerate(conversation, 1):
+            resp_type = q.get("response_type", "answered")
+            if resp_type == "answered":
+                eval_type = "partial"  # Default to partial since we can't verify
+                score = 6
+            elif resp_type == "skipped":
+                eval_type = "skipped"
+                score = 0
+            elif resp_type == "silent":
+                eval_type = "silent"
+                score = 0
+            elif resp_type == "irrelevant":
+                eval_type = "irrelevant"
+                score = 0
+            else:
+                eval_type = "partial"
+                score = 5
+            
+            question_analysis.append({
+                "question_number": i,
+                "question": q.get("question", "")[:200],
+                "answer": q.get("answer", "")[:200],
+                "concept": q.get("concept", "unknown"),
+                "evaluation": eval_type,
+                "score": score,
+                "feedback": f"Response type: {resp_type}"
+            })
+        
+        return {
+            "overall_score": round(final_score, 1),
+            "technical_score": round(final_score, 1),
+            "communication_score": round(min(100, answer_rate + 10), 1),
+            "attentiveness_score": round(max(0, 100 - (stats.get('silent_count', 0) + stats.get('irrelevant_count', 0)) * 10), 1),
+            "grade": grade,
+            "summary": f"Candidate answered {answered} out of {total} technical questions. Overall performance was {'satisfactory' if final_score >= 60 else 'needs improvement'}.",
+            "strengths": ["Participated in the session", "Attempted to answer questions"],
+            "weaknesses": [],
+            "areas_for_improvement": ["Review core concepts", "Practice articulating technical knowledge"],
+            "question_analysis": question_analysis,
+            "attentiveness_analysis": {
+                "engagement_level": "Medium" if answered > total/2 else "Low",
+                "response_consistency": "Consistent" if stats.get('silent_count', 0) < 2 else "Inconsistent",
+                "focus_areas": "Technical questions",
+                "distraction_indicators": "None detected" if stats.get('irrelevant_count', 0) == 0 else "Some off-topic responses"
+            },
+            "recommendations": [
+                "Review the topics covered in this session",
+                "Practice explaining technical concepts verbally",
+                "Focus on active listening during Q&A sessions"
+            ],
+            "topics_mastered": [],
+            "topics_to_review": list(set(q.get("concept", "general") for q in conversation[:5]))
+        }
+
+
+    def _format_evaluation_text(self, evaluation: dict) -> str:
+        """Format the detailed evaluation into human-readable text."""
+        
+        text_parts = []
+        
+        # Header
+        text_parts.append(f"=== DAILY STANDUP EVALUATION REPORT ===\n")
+        
+        # Overall Summary
+        text_parts.append(f"Overall Score: {evaluation.get('overall_score', 0)}/100 (Grade: {evaluation.get('grade', 'N/A')})")
+        text_parts.append(f"\nSummary: {evaluation.get('summary', 'No summary available.')}\n")
+        
+        # Scores Breakdown
+        text_parts.append("--- SCORE BREAKDOWN ---")
+        text_parts.append(f"Technical Knowledge: {evaluation.get('technical_score', 0)}/100")
+        text_parts.append(f"Communication: {evaluation.get('communication_score', 0)}/100")
+        text_parts.append(f"Attentiveness: {evaluation.get('attentiveness_score', 0)}/100\n")
+        
+        # Strengths
+        strengths = evaluation.get('strengths', [])
+        if strengths:
+            text_parts.append("--- STRENGTHS ---")
+            for s in strengths:
+                text_parts.append(f"✓ {s}")
+            text_parts.append("")
+        
+        # Weaknesses
+        weaknesses = evaluation.get('weaknesses', [])
+        if weaknesses:
+            text_parts.append("--- AREAS OF CONCERN ---")
+            for w in weaknesses:
+                text_parts.append(f"✗ {w}")
+            text_parts.append("")
+        
+        # Recommendations
+        recommendations = evaluation.get('recommendations', [])
+        if recommendations:
+            text_parts.append("--- RECOMMENDATIONS ---")
+            for i, r in enumerate(recommendations, 1):
+                text_parts.append(f"{i}. {r}")
+            text_parts.append("")
+        
+        # Topics
+        mastered = evaluation.get('topics_mastered', [])
+        to_review = evaluation.get('topics_to_review', [])
+        
+        if mastered:
+            text_parts.append(f"Topics Mastered: {', '.join(mastered)}")
+        if to_review:
+            text_parts.append(f"Topics to Review: {', '.join(to_review)}")
+        
+        return "\n".join(text_parts)
+
+    
 # =============================================================================
 # WEEKLY INTERVIEW NAMESPACE (WI_*)
 # =============================================================================
@@ -982,7 +1408,7 @@ class AIService:
                 return arr
         logger.warning("[MT] Using fallback scoring")
         return [1 if i % 2 == 0 else 0 for i in range(n)]
-
+         
     def _extract_feedbacks_fallback(self, response: str, n: int) -> List[str]:
         lines = response.split('\n')
         fbs = []

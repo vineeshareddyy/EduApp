@@ -11,6 +11,7 @@ Handles:
 - MySQL connections
 - MongoDB connections (async + sync)
 - Summaries, test results, interview results, session results
+- Q&A storage in ml_notes.daily_standup_results
 
 Each method retains its original name and behavior to avoid breaking imports.
 """
@@ -34,8 +35,6 @@ from .config import config
 
 logger = logging.getLogger(__name__)
 
-# =====================================================
-
 
 # ============================================================================
 # CORE CLASS
@@ -53,6 +52,11 @@ class DatabaseManager:
         self.db = None
         self.summaries_collection = None
         self.test_results_collection = None
+        
+        # Q&A storage MongoDB client (ml_notes database)
+        self._qa_mongo_client = None
+        self._qa_mongo_db = None
+        self._qa_collection = None
 
     # ------------------------------------------------------------------------
     # CONFIGURATION PROPERTIES
@@ -145,6 +149,389 @@ class DatabaseManager:
         return self._mongo_db
 
     # ------------------------------------------------------------------------
+    # Q&A STORAGE MONGODB (ml_notes.daily_standup_results)
+    # ------------------------------------------------------------------------
+    def _init_qa_mongodb(self):
+        """Initialize MongoDB connection for Q&A storage in ml_notes.daily_standup_results"""
+        try:
+            # Skip if already initialized
+            if self._qa_mongo_client is not None:
+                return
+            
+            # HARDCODED settings for ml_notes database
+            qa_host = "192.168.48.201"
+            qa_port = 27017
+            qa_user = "connectly"
+            qa_pass = "LT@connect25"
+            qa_db = "ml_notes"
+            qa_auth = "admin"
+            qa_collection_name = "daily_standup_results"
+            
+            encoded_pass = quote_plus(qa_pass)
+            qa_connection_string = (
+                f"mongodb://{qa_user}:{encoded_pass}"
+                f"@{qa_host}:{qa_port}/{qa_db}"
+                f"?authSource={qa_auth}"
+            )
+            
+            logger.info(f"🔌 Q&A: connecting to {qa_db}.{qa_collection_name}")
+            
+            self._qa_mongo_client = MongoClient(
+                qa_connection_string,
+                serverSelectionTimeoutMS=10000,
+                connectTimeoutMS=10000,
+            )
+            
+            # Test connection
+            self._qa_mongo_client.admin.command('ping')
+            
+            self._qa_mongo_db = self._qa_mongo_client[qa_db]
+            self._qa_collection = self._qa_mongo_db[qa_collection_name]
+            
+            logger.info(f"✅ Q&A ready: {qa_db}.{qa_collection_name}")
+                
+        except Exception as e:
+            logger.error(f"❌ Q&A MongoDB connection failed: {e}")
+            self._qa_mongo_client = None
+            self._qa_mongo_db = None
+            self._qa_collection = None
+            raise Exception(f"Q&A MongoDB connection failed: {e}")
+
+    def save_qa_exchange(self, session_id: str, student_id: int, student_name: str,
+                         ai_question: str, user_answer: str, concept: str,
+                         is_followup: bool = False, quality_score: float = 0.0,
+                         stage: str = "technical", test_id: str = None) -> bool:
+        """Save a single Q&A exchange to MongoDB"""
+        try:
+            if self._qa_collection is None:
+                self._init_qa_mongodb()
+            
+            qa_document = {
+                "session_id": session_id,
+                "test_id": test_id,
+                "student_id": student_id,
+                "student_name": student_name,
+                "question": ai_question,
+                "answer": user_answer,
+                "concept": concept,
+                "is_followup": is_followup,
+                "quality_score": quality_score,
+                "stage": stage,
+                "timestamp": datetime.now(),
+                "created_at": datetime.utcnow(),
+                "type": "qa_exchange",
+            }
+            
+            result = self._qa_collection.insert_one(qa_document)
+            
+            if result.inserted_id:
+                logger.info(f"✅ Q&A saved: session={session_id[:8]}..., concept={concept}")
+                return True
+            else:
+                logger.error(f"❌ Failed to save Q&A: no inserted_id returned")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Error saving Q&A to MongoDB: {e}")
+            return False
+
+    async def save_qa_exchange_async(self, session_id: str, student_id: int, student_name: str,
+                                      ai_question: str, user_answer: str, concept: str,
+                                      is_followup: bool = False, quality_score: float = 0.0,
+                                      stage: str = "technical", test_id: str = None) -> bool:
+        """Async wrapper for save_qa_exchange"""
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                self.client_manager.executor if self.client_manager else None,
+                self.save_qa_exchange,
+                session_id, student_id, student_name,
+                ai_question, user_answer, concept,
+                is_followup, quality_score, stage, test_id
+            )
+        except Exception as e:
+            logger.error(f"❌ Async Q&A save error: {e}")
+            return False
+
+
+    def save_session_qa_batch(self, session_id: str, student_id: int, student_name: str,
+                              conversation_log: list, test_id: str = None) -> bool:
+        """Save conversation with CORRECT Q&A pairing"""
+        try:
+            if self._qa_collection is None:
+                self._init_qa_mongodb()
+            
+            if not conversation_log:
+                logger.warning("No conversation log to save")
+                return True
+            
+            logger.info(f"📝 Processing {len(conversation_log)} exchanges for session {session_id}")
+            
+            paired_exchanges = []
+            answered = 0
+            skipped = 0
+            silent = 0
+            irrelevant = 0
+            repeat_requests = 0
+            auto_advanced = 0
+            
+            for idx in range(len(conversation_log)):
+                exchange = conversation_log[idx]
+                
+                ai_message = exchange.get("ai_message", "")
+                stage = exchange.get("stage", "unknown")
+                concept = exchange.get("concept", "unknown")
+                is_followup = exchange.get("is_followup", False)
+                
+                if not ai_message or len(ai_message.strip()) < 2:
+                    continue
+                
+                # ✅ GET ANSWER FROM NEXT EXCHANGE (this is the fix!)
+                user_answer = ""
+                quality_score = 0.0
+                
+                if idx + 1 < len(conversation_log):
+                    next_exchange = conversation_log[idx + 1]
+                    user_answer = next_exchange.get("user_response", "")
+                    quality_score = next_exchange.get("quality", 0.0)
+                else:
+                    user_answer = "(Session ended - no answer)"
+                
+                # Determine response type
+                response_type = "answered"
+                
+                if not user_answer or user_answer.strip() == "":
+                    response_type = "no_response"
+                elif user_answer == "(session_start)":
+                    response_type = "session_start"
+                elif user_answer == "(Session ended - no answer)":
+                    response_type = "session_ended"
+                elif user_answer == "[USER_SILENT]":
+                    response_type = "silent"
+                    silent += 1
+                elif user_answer == "[AUTO_ADVANCE]":
+                    response_type = "auto_advance"
+                    auto_advanced += 1
+                elif user_answer == "[SKIP]":
+                    response_type = "skipped"
+                    skipped += 1
+                elif user_answer == "[IRRELEVANT]":
+                    response_type = "irrelevant"
+                    irrelevant += 1
+                else:
+                    lower = user_answer.lower()
+                    if any(p in lower for p in ["repeat", "again", "what did you", "didn't hear", "pardon", "can you repeat", "say that again"]):
+                        response_type = "repeat_request"
+                        repeat_requests += 1
+                    else:
+                        response_type = "answered"
+                        answered += 1
+                
+                paired_exchanges.append({
+                    "index": len(paired_exchanges) + 1,
+                    "question": ai_message,
+                    "answer": user_answer,
+                    "response_type": response_type,
+                    "stage": stage,
+                    "concept": concept,
+                    "quality_score": quality_score,
+                    "is_followup": is_followup
+                })
+            
+            logger.info(f"📊 Paired {len(paired_exchanges)} Q&A (answered={answered}, silent={silent}, repeat={repeat_requests})")
+            
+            session_document = {
+                "session_id": session_id,
+                "test_id": test_id,
+                "student_id": student_id,
+                "student_name": student_name,
+                "total_exchanges": len(paired_exchanges),
+                "answered_count": answered,
+                "skipped_count": skipped,
+                "silent_count": silent,
+                "irrelevant_count": irrelevant,
+                "repeat_requests_count": repeat_requests,
+                "auto_advanced_count": auto_advanced,
+                "conversation": paired_exchanges,
+                "timestamp": datetime.now(),
+                "created_at": datetime.utcnow(),
+                "type": "qa_session"
+            }
+            
+            result = self._qa_collection.insert_one(session_document)
+            logger.info(f"✅ Saved {len(paired_exchanges)} correctly paired Q&A exchanges")
+            return True
+                
+        except Exception as e:
+            logger.error(f"❌ Error saving session: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def get_session_qa(self, session_id: str) -> dict:
+        """Retrieve Q&A session document for a session"""
+        try:
+            if self._qa_collection is None:
+                self._init_qa_mongodb()
+            
+            doc = self._qa_collection.find_one(
+                {"session_id": session_id, "type": "qa_session"}
+            )
+            
+            return doc if doc else {}
+            
+        except Exception as e:
+            logger.error(f"❌ Error retrieving Q&A: {e}")
+            return {}
+
+    def get_student_qa_history(self, student_id: int, limit: int = 100) -> list:
+        """Retrieve Q&A session history for a student"""
+        try:
+            if self._qa_collection is None:
+                self._init_qa_mongodb()
+            
+            cursor = self._qa_collection.find(
+                {"student_id": student_id, "type": "qa_session"}
+            ).sort("timestamp", -1).limit(limit)
+            
+            return list(cursor)
+            
+        except Exception as e:
+            logger.error(f"❌ Error retrieving student Q&A history: {e}")
+            return []
+
+     # ------------------------------------------------------------------------
+    # SESSION RESULTS (for evaluation storage and PDF generation)
+    # ------------------------------------------------------------------------
+    async def save_session_result_fast(self, session_data, evaluation: str, score: float) -> bool:
+        """Save session evaluation result to MongoDB for later PDF generation."""
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                self.client_manager.executor if self.client_manager else None,
+                self._sync_save_session_result,
+                session_data,
+                evaluation,
+                score
+            )
+        except Exception as e:
+            logger.error(f"❌ Async session result save error: {e}")
+            return False
+
+    def _sync_save_session_result(self, session_data, evaluation: str, score: float) -> bool:
+        """Synchronous method to save session result to MongoDB."""
+        try:
+            if self._qa_collection is None:
+                self._init_qa_mongodb()
+            
+            # Extract detailed evaluation if available
+            detailed_evaluation = None
+            if hasattr(session_data, 'detailed_evaluation'):
+                detailed_evaluation = session_data.detailed_evaluation
+            
+            # Build session result document
+            result_document = {
+                "session_id": session_data.session_id,
+                "test_id": session_data.test_id,
+                "student_id": session_data.student_id,
+                "student_name": session_data.student_name,
+                "evaluation": evaluation,
+                "score": score,
+                "detailed_evaluation": detailed_evaluation,
+                "duration": time.time() - session_data.created_at,
+                "total_exchanges": len(getattr(session_data, 'exchanges', [])),
+                "conversation_log": getattr(session_data, 'conversation_log', []),
+                "silence_responses": getattr(session_data, 'silence_response_count', 0),
+                "fragment_analytics": {
+                    "total_fragments": len(getattr(session_data, 'fragment_keys', [])),
+                    "concepts_covered": list(getattr(session_data, 'concept_question_counts', {}).keys()),
+                },
+                "timestamp": time.time(),
+                "created_at": datetime.utcnow(),
+                "type": "session_result"
+            }
+            
+            # Upsert - update if exists, insert if not
+            result = self._qa_collection.update_one(
+                {"session_id": session_data.session_id, "type": "session_result"},
+                {"$set": result_document},
+                upsert=True
+            )
+            
+            if result.upserted_id or result.modified_count > 0:
+                logger.info(f"✅ Session result saved: {session_data.session_id}")
+                return True
+            else:
+                logger.warning(f"⚠️ Session result unchanged: {session_data.session_id}")
+                return True  # Still consider success if document existed
+                
+        except Exception as e:
+            logger.error(f"❌ Error saving session result: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    async def get_session_result_fast(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve session result for PDF generation."""
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                self.client_manager.executor if self.client_manager else None,
+                self._sync_get_session_result,
+                session_id
+            )
+        except Exception as e:
+            logger.error(f"❌ Async session result retrieval error: {e}")
+            return None
+
+    def _sync_get_session_result(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Synchronous method to retrieve session result from MongoDB."""
+        try:
+            if self._qa_collection is None:
+                self._init_qa_mongodb()
+            
+            # First try to find session_result document
+            result = self._qa_collection.find_one(
+                {"session_id": session_id, "type": "session_result"}
+            )
+            
+            if result:
+                logger.info(f"✅ Found session_result for: {session_id}")
+                return result
+            
+            # Fallback: try to find qa_session document and build result from it
+            qa_session = self._qa_collection.find_one(
+                {"session_id": session_id, "type": "qa_session"}
+            )
+            
+            if qa_session:
+                logger.info(f"✅ Found qa_session for: {session_id}, building result")
+                # Build a result document from qa_session
+                return {
+                    "session_id": session_id,
+                    "test_id": qa_session.get("test_id"),
+                    "student_id": qa_session.get("student_id"),
+                    "student_name": qa_session.get("student_name"),
+                    "evaluation": "Session completed.",
+                    "score": 70,  # Default score
+                    "detailed_evaluation": None,
+                    "duration": 0,
+                    "total_exchanges": qa_session.get("total_exchanges", 0),
+                    "conversation_log": qa_session.get("conversation", []),
+                    "silence_responses": qa_session.get("silent_count", 0),
+                    "timestamp": qa_session.get("timestamp"),
+                    "type": "session_result"
+                }
+            
+            logger.warning(f"⚠️ No session data found for: {session_id}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Error retrieving session result: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    # ------------------------------------------------------------------------
     # DAILY_STANDUP SPECIFIC
     # ------------------------------------------------------------------------
     async def get_student_info_fast(self) -> Tuple[int, str, str, str]:
@@ -191,24 +578,52 @@ class DatabaseManager:
             raise
 
     def _sync_get_summary(self) -> str:
-        mongo_cfg = self.mongo_config
-        username = quote_plus(mongo_cfg['username'])
-        password = quote_plus(mongo_cfg['password'])
-        mongo_uri = f"mongodb://{username}:{password}@{mongo_cfg['host']}:{mongo_cfg['port']}/{mongo_cfg['auth_source']}"
+        """Fetch latest summary from MongoDB by timestamp"""
+        try:
+            mongo_cfg = self.mongo_config
+            username = quote_plus(mongo_cfg['username'])
+            password = quote_plus(mongo_cfg['password'])
+            mongo_uri = f"mongodb://{username}:{password}@{mongo_cfg['host']}:{mongo_cfg['port']}/{mongo_cfg['auth_source']}"
 
-        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-        db = client[mongo_cfg['database']]
-        collection = db[config.SUMMARIES_COLLECTION]
-        doc = collection.find_one(
-            {"summary": {"$exists": True, "$ne": None, "$ne": ""}},
-            sort=[("_id", -1)]
-        )
-        client.close()
+            client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+            db = client[mongo_cfg['database']]
+            collection = db[config.SUMMARIES_COLLECTION]
+             
+            # Sort by timestamp DESC, look for summary_text field
+            doc = collection.find_one(
+                {"summary_text": {"$exists": True, "$ne": None, "$ne": ""}},
+                sort=[("timestamp", -1)]
+            )
+            
+            # Fallback to old field name if needed
+            if not doc:
+                doc = collection.find_one(
+                    {"summary": {"$exists": True, "$ne": None, "$ne": ""}},
+                    sort=[("timestamp", -1)]
+                )
+            
+            client.close()
 
-        if not doc or not doc.get("summary"):
-            raise Exception("No valid summary found")
-        return doc["summary"].strip()
-
+            if not doc:
+                raise Exception("No valid summary found in MongoDB")
+            
+            # Try both field names
+            summary_text = doc.get("summary_text") or doc.get("summary")
+            
+            if not summary_text:
+                raise Exception("Summary field is empty")
+            
+            # Log what we fetched
+            logger.info(f"✅ Fetched summary: {len(summary_text)} chars")
+            logger.info(f"✅ Contains RFC: {'RFC' in summary_text}")
+            logger.info(f"✅ First 100 chars: {summary_text[:100]}")
+            
+            return summary_text.strip()
+            
+        except Exception as e:
+            logger.error(f"❌ Error fetching summary: {e}")
+            raise
+    
     # ------------------------------------------------------------------------
     # WEEKEND MOCKTEST SPECIFIC
     # ------------------------------------------------------------------------
@@ -359,7 +774,6 @@ class DatabaseManager:
             logger.error(f"❌ Sync 7-day summary retrieval error: {e}")
             raise Exception(f"MongoDB 7-day summary retrieval failed: {e}")
 
-
     # ------------------------------------------------------------------------
     # COMMON UTILITIES
     # ------------------------------------------------------------------------
@@ -368,6 +782,8 @@ class DatabaseManager:
             self._mongo_client.close()
         if self.mongo_client:
             self.mongo_client.close()
+        if self._qa_mongo_client:
+            self._qa_mongo_client.close()
         logger.info("🔌 Database connections closed")
 
 

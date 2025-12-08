@@ -128,7 +128,7 @@ if __name__ == "__main__":
     import os
 
     local_ip = get_local_ip()
-    port = 8090
+    port = 8030
 
     ssl_key = Path("./certs/key.pem")
     ssl_cert = Path("./certs/cert.pem")
