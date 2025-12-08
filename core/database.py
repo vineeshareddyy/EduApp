@@ -419,17 +419,69 @@ class DatabaseManager:
             return False
 
     def _sync_save_session_result(self, session_data, evaluation: str, score: float) -> bool:
-        """Synchronous method to save session result to MongoDB."""
+        """Synchronous method to save session result to MongoDB with CORRECT Q&A pairing."""
         try:
             if self._qa_collection is None:
                 self._init_qa_mongodb()
+            
+            # Get raw conversation log
+            raw_conversation_log = getattr(session_data, 'conversation_log', [])
+            
+            logger.info(f"📝 Processing {len(raw_conversation_log)} raw conversation entries for storage")
+            
+            # ✅ TRANSFORM TO CORRECT PAIRING - Same logic as save_qa_to_mongodb
+            corrected_conversation_log = []
+            
+            for idx in range(len(raw_conversation_log)):
+                entry = raw_conversation_log[idx]
+                
+                ai_message = entry.get("ai_message", "")
+                stage = entry.get("stage", "unknown")
+                concept = entry.get("concept", "unknown")
+                is_followup = entry.get("is_followup", False)
+                timestamp = entry.get("timestamp", 0)
+                
+                # Skip entries without meaningful AI message
+                if not ai_message or len(ai_message.strip()) < 5:
+                    continue
+                
+                # ✅ GET ANSWER FROM NEXT ENTRY (the fix!)
+                user_answer = ""
+                quality_score = 0.0
+                
+                if idx + 1 < len(raw_conversation_log):
+                    next_entry = raw_conversation_log[idx + 1]
+                    user_answer = next_entry.get("user_response", "")
+                    quality_score = next_entry.get("quality", 0.0)
+                else:
+                    user_answer = "(Session ended - no answer)"
+                
+                # Skip placeholder entries
+                if user_answer == "(session_start)":
+                    continue
+                
+                corrected_conversation_log.append({
+                    "timestamp": timestamp,
+                    "stage": stage,
+                    "ai_message": ai_message,
+                    "user_response": user_answer,  # ✅ Now correctly paired!
+                    "quality": quality_score,
+                    "concept": concept,
+                    "is_followup": is_followup
+                })
+            
+            logger.info(f"✅ Transformed to {len(corrected_conversation_log)} correctly paired exchanges")
+            
+            # Log first few pairs for verification
+            for i, pair in enumerate(corrected_conversation_log[:3]):
+                logger.info(f"📊 Pair {i+1}: Q='{pair['ai_message'][:40]}...' A='{pair['user_response'][:40]}...'")
             
             # Extract detailed evaluation if available
             detailed_evaluation = None
             if hasattr(session_data, 'detailed_evaluation'):
                 detailed_evaluation = session_data.detailed_evaluation
             
-            # Build session result document
+            # Build session result document with CORRECTED conversation log
             result_document = {
                 "session_id": session_data.session_id,
                 "test_id": session_data.test_id,
@@ -439,8 +491,8 @@ class DatabaseManager:
                 "score": score,
                 "detailed_evaluation": detailed_evaluation,
                 "duration": time.time() - session_data.created_at,
-                "total_exchanges": len(getattr(session_data, 'exchanges', [])),
-                "conversation_log": getattr(session_data, 'conversation_log', []),
+                "total_exchanges": len(corrected_conversation_log),
+                "conversation_log": corrected_conversation_log,  # ✅ CORRECTED VERSION!
                 "silence_responses": getattr(session_data, 'silence_response_count', 0),
                 "fragment_analytics": {
                     "total_fragments": len(getattr(session_data, 'fragment_keys', [])),
@@ -470,7 +522,7 @@ class DatabaseManager:
             import traceback
             traceback.print_exc()
             return False
-
+            
     async def get_session_result_fast(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve session result for PDF generation."""
         try:

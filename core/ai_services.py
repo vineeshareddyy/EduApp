@@ -581,30 +581,39 @@ class DS_OptimizedConversationManager:
     
     async def generate_fast_evaluation(self, session_data) -> Tuple[str, float, dict]:
         """
-        Enhanced evaluation that provides comprehensive analysis.
-        Returns: (evaluation_text, score, detailed_evaluation_dict)
+        COMPREHENSIVE evaluation that calculates REAL scores based on actual performance.
+        
+        Returns: (evaluation_text, overall_score, detailed_evaluation_dict)
         """
         try:
-            # Get conversation_log for processing
             conversation_log = getattr(session_data, "conversation_log", [])
             
             if not conversation_log:
                 raise Exception("No conversation data found for evaluation")
             
-            logger.info(f"📊 Evaluation: Processing {len(conversation_log)} conversation entries")
+            logger.info(f"📊 Starting comprehensive evaluation with {len(conversation_log)} entries")
             
-            # ✅ FIXED: Build correctly paired Q&A using the SAME logic as MongoDB save
-            # The conversation_log stores: AI message at index i, user's answer at index i+1
+            # =====================================================================
+            # STEP 1: Build correctly paired Q&A exchanges
+            # =====================================================================
             paired_exchanges = []
+            
+            # Statistics tracking
             stats = {
                 'duration_minutes': round((time.time() - session_data.created_at) / 60, 1),
-                'total_questions': 0,
+                'total_technical_questions': 0,
                 'answered_count': 0,
+                'correct_count': 0,
+                'partial_count': 0,
+                'incorrect_count': 0,
                 'skipped_count': 0,
                 'silent_count': 0,
                 'irrelevant_count': 0,
                 'repeat_requests_count': 0,
-                'auto_advanced_count': 0
+                'greeting_exchanges': 0,
+                'concepts_covered': set(),
+                'concepts_strong': set(),
+                'concepts_weak': set(),
             }
             
             for idx in range(len(conversation_log)):
@@ -614,13 +623,15 @@ class DS_OptimizedConversationManager:
                 stage = entry.get("stage", "unknown")
                 concept = entry.get("concept", "unknown")
                 is_followup = entry.get("is_followup", False)
+                quality = entry.get("quality", 0.0)
                 
-                # Skip if no AI message or too short
+                # Skip empty messages
                 if not ai_message or len(ai_message.strip()) < 10:
                     continue
                 
-                # Skip greetings for technical evaluation
+                # Track greetings separately
                 if stage == "greeting":
+                    stats['greeting_exchanges'] += 1
                     continue
                 
                 # Skip silence prompt messages (not real questions)
@@ -629,133 +640,454 @@ class DS_OptimizedConversationManager:
                     "are you there", "still with me", "can you hear", 
                     "are you still", "hello?", "you there", "are you ready",
                     "just checking", "i'd love to hear", "take your time",
-                    "need me to repeat"
+                    "need me to repeat", "i'm here when", "let me know"
                 ]
                 if any(phrase in ai_msg_lower for phrase in silence_prompt_phrases):
                     continue
                 
-                # ✅ GET ANSWER FROM NEXT EXCHANGE (this is the fix!)
+                # Get answer from NEXT entry (correct pairing)
                 user_answer = ""
-                quality_score = 0.0
+                answer_quality = 0.0
                 
                 if idx + 1 < len(conversation_log):
                     next_entry = conversation_log[idx + 1]
                     user_answer = next_entry.get("user_response", "")
-                    quality_score = next_entry.get("quality", 0.0)
+                    answer_quality = next_entry.get("quality", 0.0)
                 else:
                     user_answer = "(Session ended - no answer)"
                 
-                # Skip placeholder answers
+                # Skip placeholder
                 if user_answer == "(session_start)":
                     continue
                 
-                # Determine response type
+                # Determine response type and categorize
                 response_type = "answered"
+                evaluation_result = "pending"
+                score_for_question = 0
                 
                 if not user_answer or user_answer.strip() == "":
                     response_type = "no_response"
+                    evaluation_result = "no_response"
+                    score_for_question = 0
                 elif user_answer == "(Session ended - no answer)":
                     response_type = "session_ended"
+                    evaluation_result = "session_ended"
+                    score_for_question = 0
                 elif user_answer == "[USER_SILENT]":
                     response_type = "silent"
+                    evaluation_result = "silent"
+                    score_for_question = 0
                     stats['silent_count'] += 1
-                elif user_answer == "[AUTO_ADVANCE]":
-                    response_type = "auto_advance"
-                    stats['auto_advanced_count'] += 1
                 elif user_answer == "[SKIP]":
                     response_type = "skipped"
+                    evaluation_result = "skipped"
+                    score_for_question = 0
                     stats['skipped_count'] += 1
                 elif user_answer == "[IRRELEVANT]":
                     response_type = "irrelevant"
+                    evaluation_result = "irrelevant"
+                    score_for_question = 0
                     stats['irrelevant_count'] += 1
+                elif user_answer == "[AUTO_ADVANCE]":
+                    response_type = "auto_advance"
+                    evaluation_result = "no_response"
+                    score_for_question = 0
                 else:
-                    lower = user_answer.lower()
-                    if any(p in lower for p in ["repeat", "again", "what did you", "didn't hear", "pardon", "can you repeat", "say that again"]):
+                    # Check for repeat request
+                    lower_answer = user_answer.lower()
+                    if any(p in lower_answer for p in ["repeat", "again", "what did you", "didn't hear", "pardon", "can you repeat"]):
                         response_type = "repeat_request"
+                        evaluation_result = "repeat_request"
+                        score_for_question = 0
                         stats['repeat_requests_count'] += 1
                     else:
+                        # This is an actual answer - evaluate quality
                         response_type = "answered"
                         stats['answered_count'] += 1
+                        
+                        # Use quality score from transcription as base
+                        # Quality 0.85+ = likely correct, 0.6-0.85 = partial, <0.6 = needs review
+                        if answer_quality >= 0.85:
+                            evaluation_result = "correct"
+                            score_for_question = 9
+                            stats['correct_count'] += 1
+                            stats['concepts_strong'].add(concept)
+                        elif answer_quality >= 0.6:
+                            evaluation_result = "partial"
+                            score_for_question = 6
+                            stats['partial_count'] += 1
+                        else:
+                            evaluation_result = "partial"
+                            score_for_question = 5
+                            stats['partial_count'] += 1
+                        
+                        # Track concept coverage
+                        stats['concepts_covered'].add(concept)
                 
-                # Only include technical questions in evaluation
-                stats['total_questions'] += 1
+                stats['total_technical_questions'] += 1
+                
                 paired_exchanges.append({
+                    "question_number": stats['total_technical_questions'],
                     "question": ai_message,
                     "answer": user_answer if response_type == "answered" else f"[{response_type.upper()}]",
                     "response_type": response_type,
                     "concept": concept,
-                    "quality_score": quality_score,
+                    "quality_score": answer_quality,
+                    "evaluation": evaluation_result,
+                    "score": score_for_question,
                     "is_followup": is_followup
                 })
             
-            logger.info(f"📊 Evaluation: Paired {len(paired_exchanges)} Q&A exchanges")
-            logger.info(f"📊 Stats: answered={stats['answered_count']}, silent={stats['silent_count']}, skipped={stats['skipped_count']}, irrelevant={stats['irrelevant_count']}")
+            logger.info(f"📊 Paired {len(paired_exchanges)} technical Q&A exchanges")
+            logger.info(f"📊 Stats: answered={stats['answered_count']}, correct={stats['correct_count']}, partial={stats['partial_count']}")
+            logger.info(f"📊 Stats: silent={stats['silent_count']}, skipped={stats['skipped_count']}, irrelevant={stats['irrelevant_count']}")
             
-            # Log first few pairs for debugging
-            for i, pair in enumerate(paired_exchanges[:3]):
-                logger.info(f"📊 Pair {i+1}: Q='{pair['question'][:50]}...' A='{pair['answer'][:50]}...'")
+            # =====================================================================
+            # STEP 2: Calculate DYNAMIC scores
+            # =====================================================================
             
-            if not paired_exchanges:
-                raise Exception("No technical exchanges found for evaluation")
+            total_questions = stats['total_technical_questions'] or 1
+            answered = stats['answered_count']
+            correct = stats['correct_count']
+            partial = stats['partial_count']
             
-            # Use paired_exchanges for evaluation
-            conversation_for_eval = paired_exchanges
-            # Build comprehensive evaluation session data
-            eval_session_data = {
-                "student_name": session_data.student_name,
-                "duration_minutes": stats['duration_minutes'],
-                "conversation": conversation_for_eval,
-                "stats": stats
-            }
+            # ----- TECHNICAL SCORE (0-100) - REAL-TIME PERCENTAGE -----
+            # Based on: Quality-weighted percentage of correct/partial answers
+            if total_questions > 0:
+                # Calculate quality-weighted score
+                # Correct = 100%, Partial = 60%, Others = 0%
+                quality_points = (correct * 1.0) + (partial * 0.6)
+                max_possible = total_questions * 1.0
+                
+                technical_score = (quality_points / max_possible) * 100
+                technical_score = round(technical_score, 1)
+                
+                logger.info(f"📊 Technical Score (Real-Time):")
+                logger.info(f"   - Total questions: {total_questions}")
+                logger.info(f"   - Correct answers: {correct} (×1.0 = {correct})")
+                logger.info(f"   - Partial answers: {partial} (×0.6 = {partial * 0.6})")
+                logger.info(f"   - Quality points: {quality_points}/{max_possible}")
+                logger.info(f"   - Technical score: {technical_score}/100")
+            else:
+                technical_score = 0
             
-            # Import the comprehensive evaluation prompt
-            from core.prompts import comprehensive_evaluation_prompt
+            # ----- COMMUNICATION SCORE (0-100) - REAL-TIME PERCENTAGE -----
+            # Based on: Response rate + quality factor - clarity issues
+            if total_questions > 0:
+                # Base: What percentage of questions got a response attempt?
+                response_attempts = answered + stats['irrelevant_count']  # They tried to answer
+                response_rate = (response_attempts / total_questions) * 100
+                
+                # Quality factor: Of the responses, how many were on-topic?
+                if response_attempts > 0:
+                    on_topic_rate = answered / response_attempts
+                    quality_factor = on_topic_rate * 30  # Up to 30 bonus points
+                else:
+                    quality_factor = 0
+                
+                # Clarity penalty: Repeat requests indicate unclear communication
+                clarity_penalty = min(stats['repeat_requests_count'] * 3, 15)
+                
+                # Calculate communication score
+                communication_score = response_rate + quality_factor - clarity_penalty
+                communication_score = max(0, min(100, communication_score))  # Clamp 0-100
+                communication_score = round(communication_score, 1)
+                
+                logger.info(f"📊 Communication Score (Real-Time):")
+                logger.info(f"   - Response attempts: {response_attempts}/{total_questions} = {response_rate:.1f}%")
+                logger.info(f"   - On-topic rate: {on_topic_rate:.1%} → +{quality_factor:.1f} bonus")
+                logger.info(f"   - Clarity penalty: -{clarity_penalty} (from {stats['repeat_requests_count']} repeats)")
+                logger.info(f"   - Communication score: {communication_score}/100")
+            else:
+                communication_score = 50
             
-            eval_prompt = comprehensive_evaluation_prompt(eval_session_data)
+            # ----- ATTENTIVENESS SCORE (0-100) - REAL-TIME PERCENTAGE -----
+            # Based on: Percentage of engaged responses vs problematic responses
+            if total_questions > 0:
+                # Count problematic responses (show lack of attention)
+                problem_responses = (
+                    stats['silent_count'] +      # Didn't respond at all
+                    stats['irrelevant_count'] +  # Gave off-topic answer
+                    stats['skipped_count']       # Explicitly skipped
+                )
+                
+                # Calculate engagement rate
+                engaged_responses = max(0, total_questions - problem_responses)
+                engagement_rate = engaged_responses / total_questions
+                
+                # Base attentiveness on engagement rate
+                base_attentiveness = engagement_rate * 100
+                
+                # Small penalty for excessive repeat requests
+                repeat_penalty = min(stats['repeat_requests_count'] * 2, 10)
+                
+                # Calculate final attentiveness
+                attentiveness_score = max(0, base_attentiveness - repeat_penalty)
+                attentiveness_score = round(attentiveness_score, 1)
+                
+                logger.info(f"📊 Attentiveness Score (Real-Time):")
+                logger.info(f"   - Problem responses: {problem_responses} (silent={stats['silent_count']}, irrelevant={stats['irrelevant_count']}, skipped={stats['skipped_count']})")
+                logger.info(f"   - Engaged responses: {engaged_responses}/{total_questions} = {engagement_rate:.1%}")
+                logger.info(f"   - Repeat penalty: -{repeat_penalty}")
+                logger.info(f"   - Attentiveness score: {attentiveness_score}/100")
+            else:
+                attentiveness_score = 50
             
-            # Call LLM for comprehensive evaluation
-            loop = asyncio.get_event_loop()
-            eval_response = await loop.run_in_executor(
-                self.client_manager.executor,
-                self._sync_openai_call,
-                eval_prompt,
+            # ----- OVERALL SCORE (weighted average) -----
+            # Technical: 50%, Communication: 25%, Attentiveness: 25%
+            overall_score = round(
+                (technical_score * 0.50) + 
+                (communication_score * 0.25) + 
+                (attentiveness_score * 0.25), 
+                1
             )
             
-            # Parse JSON response
-            detailed_evaluation = None
-            try:
-                # Clean up response - remove markdown code blocks if present
-                clean_response = eval_response.strip()
-                if clean_response.startswith("```json"):
-                    clean_response = clean_response[7:]
-                if clean_response.startswith("```"):
-                    clean_response = clean_response[3:]
-                if clean_response.endswith("```"):
-                    clean_response = clean_response[:-3]
-                clean_response = clean_response.strip()
+            logger.info(f"📊 Overall Score Calculation:")
+            logger.info(f"   - Technical ({technical_score}) × 0.50 = {technical_score * 0.50:.1f}")
+            logger.info(f"   - Communication ({communication_score}) × 0.25 = {communication_score * 0.25:.1f}")
+            logger.info(f"   - Attentiveness ({attentiveness_score}) × 0.25 = {attentiveness_score * 0.25:.1f}")
+            logger.info(f"   - OVERALL: {overall_score}/100")
+            
+            # =====================================================================
+            # STEP 3: Determine GRADE
+            # =====================================================================
+            if overall_score >= 93: grade = "A"
+            elif overall_score >= 90: grade = "A-"
+            elif overall_score >= 87: grade = "B+"
+            elif overall_score >= 83: grade = "B"
+            elif overall_score >= 80: grade = "B-"
+            elif overall_score >= 77: grade = "C+"
+            elif overall_score >= 73: grade = "C"
+            elif overall_score >= 70: grade = "C-"
+            elif overall_score >= 67: grade = "D+"
+            elif overall_score >= 60: grade = "D"
+            else: grade = "F"
+            
+            # =====================================================================
+            # STEP 4: Generate PERSONALIZED strengths and weaknesses
+            # =====================================================================
+            strengths = []
+            weaknesses = []
+            areas_for_improvement = []
+            
+            # ----- Analyze STRENGTHS -----
+            if correct >= total_questions * 0.7:
+                strengths.append("Strong technical knowledge demonstrated across most questions")
+            elif correct >= total_questions * 0.5:
+                strengths.append("Good understanding of core technical concepts")
+            
+            if stats['silent_count'] == 0 and stats['irrelevant_count'] == 0:
+                strengths.append("Excellent focus and attentiveness throughout the session")
+            elif stats['silent_count'] <= 2:
+                strengths.append("Generally attentive with minimal distractions")
+            
+            if answered >= total_questions * 0.8:
+                strengths.append("High engagement - attempted to answer most questions")
+            
+            if stats['repeat_requests_count'] <= 1:
+                strengths.append("Good listening skills - understood questions clearly")
+            
+            if len(stats['concepts_strong']) > 0:
+                strong_topics = list(stats['concepts_strong'])[:3]
+                # Clean up topic names
+                clean_topics = [t.replace('**', '').replace('*', '').strip()[:30] for t in strong_topics if t and t != 'unknown']
+                if clean_topics:
+                    strengths.append(f"Demonstrated strong knowledge in: {', '.join(clean_topics)}")
+            
+            if communication_score >= 80:
+                strengths.append("Clear and effective communication of technical concepts")
+            
+            # Ensure at least one strength
+            if not strengths:
+                if answered > 0:
+                    strengths.append("Participated actively in the session")
+                else:
+                    strengths.append("Completed the session")
+            
+            # ----- Analyze WEAKNESSES -----
+            if stats['silent_count'] >= 5:
+                weaknesses.append(f"Frequent unresponsiveness ({stats['silent_count']} silent periods)")
+                areas_for_improvement.append("Practice staying engaged and responding promptly to questions")
+            elif stats['silent_count'] >= 3:
+                weaknesses.append(f"Multiple silent periods ({stats['silent_count']} times)")
+                areas_for_improvement.append("Work on maintaining focus throughout technical discussions")
+            
+            if stats['irrelevant_count'] >= 3:
+                weaknesses.append(f"Multiple off-topic responses ({stats['irrelevant_count']} times)")
+                areas_for_improvement.append("Focus on understanding the question before answering")
+            elif stats['irrelevant_count'] >= 1:
+                weaknesses.append("Some responses were not directly related to the questions")
+            
+            if stats['skipped_count'] >= 3:
+                weaknesses.append(f"Skipped several questions ({stats['skipped_count']} times)")
+                areas_for_improvement.append("Review fundamental concepts to build confidence in answering")
+            
+            if technical_score < 50:
+                weaknesses.append("Technical knowledge needs significant improvement")
+                areas_for_improvement.append("Deep dive into the core concepts covered in this session")
+            elif technical_score < 70:
+                weaknesses.append("Some gaps in technical understanding")
+                areas_for_improvement.append("Review and practice the topics where answers were incomplete")
+            
+            if stats['repeat_requests_count'] >= 3:
+                weaknesses.append("Frequently asked for questions to be repeated")
+                areas_for_improvement.append("Practice active listening during technical discussions")
+            
+            # Identify weak concepts
+            weak_concepts = []
+            for ex in paired_exchanges:
+                if ex['evaluation'] in ['incorrect', 'irrelevant', 'skipped', 'silent'] and ex['concept'] != 'unknown':
+                    weak_concepts.append(ex['concept'])
+            
+            if weak_concepts:
+                unique_weak = list(set(weak_concepts))[:3]
+                clean_weak = [c.replace('**', '').replace('*', '').strip()[:30] for c in unique_weak if c]
+                if clean_weak:
+                    areas_for_improvement.append(f"Focus on reviewing: {', '.join(clean_weak)}")
+            
+            # Default recommendations if none generated
+            if not areas_for_improvement:
+                if technical_score < 80:
+                    areas_for_improvement.append("Continue practicing technical explanations")
+                areas_for_improvement.append("Regular review of key concepts will strengthen retention")
+            
+            # =====================================================================
+            # STEP 5: Build question-by-question analysis
+            # =====================================================================
+            question_analysis = []
+            for ex in paired_exchanges:
+                feedback = ""
                 
-                detailed_evaluation = json.loads(clean_response)
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse evaluation JSON: {e}")
-                logger.error(f"Response was: {eval_response[:500]}")
-                # Create a fallback evaluation
-                detailed_evaluation = self._create_fallback_evaluation(stats, conversation_for_eval)
+                if ex['evaluation'] == 'correct':
+                    feedback = "Excellent answer demonstrating clear understanding"
+                elif ex['evaluation'] == 'partial':
+                    feedback = "Partially correct - answer could be more complete"
+                elif ex['evaluation'] == 'incorrect':
+                    feedback = "Answer was not accurate - review this concept"
+                elif ex['evaluation'] == 'skipped':
+                    feedback = "Question was skipped - attempt to answer even if unsure"
+                elif ex['evaluation'] == 'silent':
+                    feedback = "No response provided - practice articulating answers"
+                elif ex['evaluation'] == 'irrelevant':
+                    feedback = "Response was off-topic - focus on the specific question asked"
+                elif ex['evaluation'] == 'repeat_request':
+                    feedback = "Asked to repeat - try to catch the question first time"
+                else:
+                    feedback = f"Response type: {ex['response_type']}"
+                
+                question_analysis.append({
+                    "question_number": ex['question_number'],
+                    "question": ex['question'][:300],
+                    "answer": ex['answer'][:300] if ex['answer'] else "[No answer]",
+                    "concept": ex['concept'].replace('**', '').replace('*', '').strip()[:50] if ex['concept'] else "General",
+                    "evaluation": ex['evaluation'],
+                    "score": ex['score'],
+                    "feedback": feedback
+                })
             
-            # Extract overall score
-            overall_score = detailed_evaluation.get("overall_score", 70)
+            # =====================================================================
+            # STEP 6: Attentiveness analysis
+            # =====================================================================
+            if attentiveness_score >= 80:
+                engagement_level = "High"
+            elif attentiveness_score >= 50:
+                engagement_level = "Medium"
+            else:
+                engagement_level = "Low"
             
-            # Generate human-readable evaluation text
+            if stats['silent_count'] <= 2 and stats['irrelevant_count'] <= 1:
+                response_consistency = "Consistent"
+            else:
+                response_consistency = "Inconsistent"
+            
+            focus_areas = "Technical questions" if answered > 0 else "Needs improvement"
+            
+            distraction_indicators = []
+            if stats['silent_count'] > 2:
+                distraction_indicators.append(f"{stats['silent_count']} silent periods")
+            if stats['irrelevant_count'] > 0:
+                distraction_indicators.append(f"{stats['irrelevant_count']} off-topic responses")
+            if stats['repeat_requests_count'] > 2:
+                distraction_indicators.append(f"{stats['repeat_requests_count']} repeat requests")
+            
+            attentiveness_analysis = {
+                "engagement_level": engagement_level,
+                "response_consistency": response_consistency,
+                "focus_areas": focus_areas,
+                "distraction_indicators": ", ".join(distraction_indicators) if distraction_indicators else "None detected"
+            }
+            
+            # =====================================================================
+            # STEP 7: Topics mastered vs to review
+            # =====================================================================
+            topics_mastered = list(stats['concepts_strong'])[:5]
+            topics_mastered = [t.replace('**', '').replace('*', '').strip()[:40] for t in topics_mastered if t and t != 'unknown']
+            
+            topics_to_review = list(set(weak_concepts))[:5]
+            topics_to_review = [t.replace('**', '').replace('*', '').strip()[:40] for t in topics_to_review if t and t != 'unknown']
+            
+            # =====================================================================
+            # STEP 8: Generate summary
+            # =====================================================================
+            if overall_score >= 80:
+                performance_desc = "excellent"
+            elif overall_score >= 70:
+                performance_desc = "good"
+            elif overall_score >= 60:
+                performance_desc = "satisfactory"
+            elif overall_score >= 50:
+                performance_desc = "needs improvement"
+            else:
+                performance_desc = "requires significant improvement"
+            
+            summary = f"Candidate answered {answered} out of {total_questions} technical questions. "
+            summary += f"Overall performance was {performance_desc} with a technical score of {technical_score}/100."
+            
+            # =====================================================================
+            # STEP 9: Build final detailed evaluation
+            # =====================================================================
+            detailed_evaluation = {
+                "overall_score": overall_score,
+                "technical_score": technical_score,
+                "communication_score": communication_score,
+                "attentiveness_score": attentiveness_score,
+                "grade": grade,
+                "summary": summary,
+                "strengths": strengths,
+                "weaknesses": weaknesses,
+                "areas_for_improvement": areas_for_improvement,
+                "question_analysis": question_analysis,
+                "attentiveness_analysis": attentiveness_analysis,
+                "recommendations": areas_for_improvement[:5],
+                "topics_mastered": topics_mastered,
+                "topics_to_review": topics_to_review,
+                "raw_stats": {
+                    "total_questions": total_questions,
+                    "answered_count": answered,
+                    "correct_count": correct,
+                    "partial_count": partial,
+                    "skipped_count": stats['skipped_count'],
+                    "silent_count": stats['silent_count'],
+                    "irrelevant_count": stats['irrelevant_count'],
+                    "repeat_requests_count": stats['repeat_requests_count'],
+                    "duration_minutes": stats['duration_minutes'],
+                    "greeting_exchanges": stats['greeting_exchanges']
+                },
+                "session_info": {
+                    "session_id": session_data.session_id,
+                    "test_id": session_data.test_id,
+                    "student_id": session_data.student_id,
+                    "student_name": session_data.student_name,
+                    "duration_minutes": stats['duration_minutes']
+                }
+            }
+            
+            # =====================================================================
+            # STEP 10: Generate human-readable evaluation text
+            # =====================================================================
             evaluation_text = self._format_evaluation_text(detailed_evaluation)
             
-            # Add raw stats to detailed evaluation
-            detailed_evaluation["raw_stats"] = stats
-            detailed_evaluation["session_info"] = {
-                "session_id": session_data.session_id,
-                "test_id": session_data.test_id,
-                "student_id": session_data.student_id,
-                "student_name": session_data.student_name,
-                "duration_minutes": stats['duration_minutes']
-            }
+            logger.info(f"✅ Comprehensive evaluation complete: Score={overall_score}, Grade={grade}")
             
             return evaluation_text, overall_score, detailed_evaluation
             
@@ -763,95 +1095,19 @@ class DS_OptimizedConversationManager:
             logger.error(f"[DS] Comprehensive evaluation error: {e}")
             import traceback
             traceback.print_exc()
-            # Return basic evaluation on error
+            
+            # Return basic fallback
             return "Evaluation could not be completed due to an error.", 50.0, {
                 "error": str(e),
                 "overall_score": 50,
+                "technical_score": 50,
+                "communication_score": 50,
+                "attentiveness_score": 50,
+                "grade": "C",
                 "summary": "Evaluation encountered an error"
             }
 
-
-    def _create_fallback_evaluation(self, stats: dict, conversation: list) -> dict:
-        """Create a basic evaluation when LLM parsing fails."""
-        
-        total = stats.get('total_questions', 1) or 1
-        answered = stats.get('answered_count', 0)
-        
-        # Calculate basic score
-        answer_rate = (answered / total) * 100 if total > 0 else 0
-        base_score = min(100, max(0, answer_rate))
-        
-        # Penalties
-        penalty = (stats.get('skipped_count', 0) * 5 +
-                stats.get('silent_count', 0) * 3 +
-                stats.get('irrelevant_count', 0) * 7)
-        
-        final_score = max(30, base_score - penalty)
-        
-        # Determine grade
-        if final_score >= 90: grade = "A"
-        elif final_score >= 80: grade = "B"
-        elif final_score >= 70: grade = "C"
-        elif final_score >= 60: grade = "D"
-        else: grade = "F"
-        
-        # Build question analysis
-        question_analysis = []
-        for i, q in enumerate(conversation, 1):
-            resp_type = q.get("response_type", "answered")
-            if resp_type == "answered":
-                eval_type = "partial"  # Default to partial since we can't verify
-                score = 6
-            elif resp_type == "skipped":
-                eval_type = "skipped"
-                score = 0
-            elif resp_type == "silent":
-                eval_type = "silent"
-                score = 0
-            elif resp_type == "irrelevant":
-                eval_type = "irrelevant"
-                score = 0
-            else:
-                eval_type = "partial"
-                score = 5
-            
-            question_analysis.append({
-                "question_number": i,
-                "question": q.get("question", "")[:200],
-                "answer": q.get("answer", "")[:200],
-                "concept": q.get("concept", "unknown"),
-                "evaluation": eval_type,
-                "score": score,
-                "feedback": f"Response type: {resp_type}"
-            })
-        
-        return {
-            "overall_score": round(final_score, 1),
-            "technical_score": round(final_score, 1),
-            "communication_score": round(min(100, answer_rate + 10), 1),
-            "attentiveness_score": round(max(0, 100 - (stats.get('silent_count', 0) + stats.get('irrelevant_count', 0)) * 10), 1),
-            "grade": grade,
-            "summary": f"Candidate answered {answered} out of {total} technical questions. Overall performance was {'satisfactory' if final_score >= 60 else 'needs improvement'}.",
-            "strengths": ["Participated in the session", "Attempted to answer questions"],
-            "weaknesses": [],
-            "areas_for_improvement": ["Review core concepts", "Practice articulating technical knowledge"],
-            "question_analysis": question_analysis,
-            "attentiveness_analysis": {
-                "engagement_level": "Medium" if answered > total/2 else "Low",
-                "response_consistency": "Consistent" if stats.get('silent_count', 0) < 2 else "Inconsistent",
-                "focus_areas": "Technical questions",
-                "distraction_indicators": "None detected" if stats.get('irrelevant_count', 0) == 0 else "Some off-topic responses"
-            },
-            "recommendations": [
-                "Review the topics covered in this session",
-                "Practice explaining technical concepts verbally",
-                "Focus on active listening during Q&A sessions"
-            ],
-            "topics_mastered": [],
-            "topics_to_review": list(set(q.get("concept", "general") for q in conversation[:5]))
-        }
-
-
+    
     def _format_evaluation_text(self, evaluation: dict) -> str:
         """Format the detailed evaluation into human-readable text."""
         
@@ -905,7 +1161,54 @@ class DS_OptimizedConversationManager:
         
         return "\n".join(text_parts)
 
-    
+
+    def _create_fallback_evaluation(self, stats: dict, conversation: list) -> dict:
+        """Create a basic evaluation when LLM parsing fails."""
+        
+        total = stats.get('total_questions', 1) or 1
+        answered = stats.get('answered_count', 0)
+        
+        # Calculate basic score
+        answer_rate = (answered / total) * 100 if total > 0 else 0
+        base_score = min(100, max(0, answer_rate))
+        
+        # Penalties
+        penalty = (stats.get('skipped_count', 0) * 5 +
+                stats.get('silent_count', 0) * 3 +
+                stats.get('irrelevant_count', 0) * 7)
+        
+        final_score = max(30, base_score - penalty)
+        
+        # Determine grade
+        if final_score >= 90: grade = "A"
+        elif final_score >= 80: grade = "B"
+        elif final_score >= 70: grade = "C"
+        elif final_score >= 60: grade = "D"
+        else: grade = "F"
+        
+        return {
+            "overall_score": round(final_score, 1),
+            "technical_score": round(final_score, 1),
+            "communication_score": round(min(100, answer_rate + 10), 1),
+            "attentiveness_score": round(max(0, 100 - (stats.get('silent_count', 0) + stats.get('irrelevant_count', 0)) * 10), 1),
+            "grade": grade,
+            "summary": f"Candidate answered {answered} out of {total} technical questions.",
+            "strengths": ["Participated in the session"],
+            "weaknesses": [],
+            "areas_for_improvement": ["Review core concepts"],
+            "question_analysis": [],
+            "attentiveness_analysis": {
+                "engagement_level": "Medium",
+                "response_consistency": "Consistent",
+                "focus_areas": "Technical questions",
+                "distraction_indicators": "None detected"
+            },
+            "recommendations": ["Continue practicing"],
+            "topics_mastered": [],
+            "topics_to_review": []
+        }
+
+
 # =============================================================================
 # WEEKLY INTERVIEW NAMESPACE (WI_*)
 # =============================================================================
