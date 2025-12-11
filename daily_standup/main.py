@@ -3436,8 +3436,34 @@ def generate_comprehensive_pdf_report(result: dict, detailed_evaluation: dict, s
         ]))
         story.append(stats_table)
         story.append(Spacer(1, 20))
-        
-        # ==================== STRENGTHS ====================
+
+        # ==================== WEAKNESSES - NOW FIRST ====================
+        weaknesses = detailed_evaluation.get("weaknesses", [])
+
+        # ✅ BUILD COMBINED WEAKNESSES WITH COMMUNICATION ISSUES
+        all_weaknesses = list(weaknesses) if weaknesses else []
+        communication_score = detailed_evaluation.get("communication_score", 100)
+        raw_stats = detailed_evaluation.get("raw_stats", {})
+
+        if communication_score < 60:
+            if communication_score < 40:
+                all_weaknesses.append("Poor communication clarity - responses were often unclear or incomplete")
+            if raw_stats.get('irrelevant_count', 0) > 3:
+                all_weaknesses.append("Frequent off-topic responses indicate difficulty understanding questions")
+            if raw_stats.get('repeat_requests_count', 0) > 2:
+                all_weaknesses.append("Multiple requests for question repetition may indicate attention or comprehension issues")
+            if raw_stats.get('answered_count', 0) < raw_stats.get('total_questions', 1) * 0.5:
+                all_weaknesses.append("Low response rate suggests difficulty articulating answers")
+
+        if all_weaknesses:
+            story.append(Paragraph("✗ Areas of Concern", header_style))
+            for weakness in all_weaknesses:
+                if isinstance(weakness, dict):
+                    weakness = weakness.get('area', str(weakness))
+                story.append(Paragraph(f"• {weakness}", bullet_style))
+            story.append(Spacer(1, 15))
+
+        # ==================== STRENGTHS - NOW SECOND ====================
         strengths = detailed_evaluation.get("strengths", [])
         if strengths:
             story.append(Paragraph("✓ Strengths", header_style))
@@ -3447,16 +3473,7 @@ def generate_comprehensive_pdf_report(result: dict, detailed_evaluation: dict, s
                 story.append(Paragraph(f"• {strength}", bullet_style))
             story.append(Spacer(1, 15))
         
-        # ==================== WEAKNESSES ====================
-        weaknesses = detailed_evaluation.get("weaknesses", [])
-        if weaknesses:
-            story.append(Paragraph("✗ Areas of Concern", header_style))
-            for weakness in weaknesses:
-                if isinstance(weakness, dict):
-                    weakness = weakness.get('area', str(weakness))
-                story.append(Paragraph(f"• {weakness}", bullet_style))
-            story.append(Spacer(1, 15))
-        
+               
         # ==================== AREAS FOR IMPROVEMENT ====================
         improvements = detailed_evaluation.get("areas_for_improvement", [])
         if improvements:
@@ -3474,7 +3491,7 @@ def generate_comprehensive_pdf_report(result: dict, detailed_evaluation: dict, s
         
         question_analysis = detailed_evaluation.get("question_analysis", [])
         
-        for qa in question_analysis[:15]:  # Limit to 15 questions to fit in report
+        for qa in question_analysis:  # Limit to 15 questions to fit in report
             q_num = qa.get("question_number", "?")
             question = qa.get("question", "")[:200]  # Truncate long questions
             answer = qa.get("answer", "")[:200]
