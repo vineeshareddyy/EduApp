@@ -771,33 +771,70 @@ class DS_OptimizedConversationManager:
             else:
                 technical_score = 0
             
-            # ----- COMMUNICATION SCORE (0-100) - REAL-TIME PERCENTAGE -----
-            # Based on: Response rate + quality factor - clarity issues
-            if total_questions > 0:
-                # Base: What percentage of questions got a response attempt?
-                response_attempts = answered + stats['irrelevant_count']  # They tried to answer
-                response_rate = (response_attempts / total_questions) * 100
+            # ----- COMMUNICATION SCORE (0-100) - OPTION B FORMULA -----
+            # ✅ FIX (Patch 9): Use correct Option B formula matching main.py Patch 2
+            # Components:
+            #   - Willingness (30 pts): % of questions attempted (not silent/skipped)
+            #   - Relevance (30 pts): % of attempts that were on-topic
+            #   - Responsiveness (25 pts): Based on average response time
+            #   - Clarity (15 pts): Penalty for repeat requests
+            
+            # First check if we have pre-calculated score from main.py
+            final_comm_score = getattr(session_data, 'final_communication_score', None)
+            
+            if final_comm_score and isinstance(final_comm_score, dict):
+                # Use the real-time calculated score from main.py (Patch 2)
+                communication_score = final_comm_score.get('total_score', 50)
+                logger.info(f"📊 Communication Score (Using Pre-Calculated from Patch 2):")
+                logger.info(f"   - Willingness: {final_comm_score.get('willingness_score', 0)}/30")
+                logger.info(f"   - Relevance: {final_comm_score.get('relevance_score', 0)}/30")
+                logger.info(f"   - Responsiveness: {final_comm_score.get('responsiveness_score', 0)}/25")
+                logger.info(f"   - Clarity: {final_comm_score.get('clarity_score', 0)}/15")
+                logger.info(f"   - TOTAL: {communication_score}/100")
+            elif total_questions > 0:
+                # Calculate using Option B formula
+                response_attempts = answered + stats['irrelevant_count']
                 
-                # Quality factor: Of the responses, how many were on-topic?
-                if response_attempts > 0:
-                    on_topic_rate = answered / response_attempts
-                    quality_factor = on_topic_rate * 30  # Up to 30 bonus points
+                # === WILLINGNESS (30 pts) ===
+                willingness_rate = response_attempts / total_questions if total_questions > 0 else 0
+                willingness_score = willingness_rate * 30
+                
+                # === RELEVANCE (30 pts) ===
+                relevance_rate = answered / response_attempts if response_attempts > 0 else 0
+                relevance_score = relevance_rate * 30
+                
+                # === RESPONSIVENESS (25 pts) ===
+                response_times = getattr(session_data, 'response_times', [])
+                if response_times:
+                    avg_time = sum(response_times) / len(response_times)
+                    if avg_time < 3:
+                        responsiveness_score = 25
+                    elif avg_time < 5:
+                        responsiveness_score = 20
+                    elif avg_time < 8:
+                        responsiveness_score = 15
+                    elif avg_time < 12:
+                        responsiveness_score = 10
+                    else:
+                        responsiveness_score = 5
                 else:
-                    quality_factor = 0
+                    responsiveness_score = 15  # Default if no timing data
+                    avg_time = 0
                 
-                # Clarity penalty: Repeat requests indicate unclear communication
+                # === CLARITY (15 pts) ===
                 clarity_penalty = min(stats['repeat_requests_count'] * 3, 15)
+                clarity_score = 15 - clarity_penalty
                 
-                # Calculate communication score
-                communication_score = response_rate + quality_factor - clarity_penalty
-                communication_score = max(0, min(100, communication_score))  # Clamp 0-100
-                communication_score = round(communication_score, 1)
+                # === TOTAL ===
+                communication_score = willingness_score + relevance_score + responsiveness_score + clarity_score
+                communication_score = max(0, min(100, round(communication_score, 1)))
                 
-                logger.info(f"📊 Communication Score (Real-Time):")
-                logger.info(f"   - Response attempts: {response_attempts}/{total_questions} = {response_rate:.1f}%")
-                logger.info(f"   - On-topic rate: {on_topic_rate:.1%} → +{quality_factor:.1f} bonus")
-                logger.info(f"   - Clarity penalty: -{clarity_penalty} (from {stats['repeat_requests_count']} repeats)")
-                logger.info(f"   - Communication score: {communication_score}/100")
+                logger.info(f"📊 Communication Score (Option B Formula):")
+                logger.info(f"   - Willingness: {willingness_score:.1f}/30 (attempts: {response_attempts}/{total_questions} = {willingness_rate:.1%})")
+                logger.info(f"   - Relevance: {relevance_score:.1f}/30 (on-topic: {answered}/{response_attempts} = {relevance_rate:.1%})")
+                logger.info(f"   - Responsiveness: {responsiveness_score}/25 (avg time: {avg_time:.1f}s)")
+                logger.info(f"   - Clarity: {clarity_score}/15 (repeats: {stats['repeat_requests_count']})")
+                logger.info(f"   - TOTAL: {communication_score}/100")
             else:
                 communication_score = 50
             

@@ -226,6 +226,123 @@ class UltraFastSessionManagerWithSilenceHandling:
         except Exception:
             return "general"
 
+    def calculate_communication_score(self, session_data) -> dict:
+        """
+        Calculate real-time communication score using Option B formula.
+        
+        Components:
+        - Willingness (30 pts): % of questions attempted (not silent/skipped)
+        - Relevance (30 pts): % of attempts that were on-topic
+        - Responsiveness (25 pts): Based on average response time
+        - Clarity (15 pts): Penalty for repeat requests
+        
+        Returns dict with score breakdown for transparency.
+        """
+        stats = getattr(session_data, 'comm_stats', {})
+        response_times = getattr(session_data, 'response_times', [])
+        
+        total = stats.get('total_questions', 0)
+        answered = stats.get('answered', 0)
+        skipped = stats.get('skipped', 0)
+        silent = stats.get('silent', 0)
+        irrelevant = stats.get('irrelevant', 0)
+        repeats = stats.get('repeat_requests', 0)
+        
+        # Handle edge case: no questions yet
+        if total == 0:
+            return {
+                "total_score": 100,
+                "willingness_score": 30,
+                "relevance_score": 30,
+                "responsiveness_score": 25,
+                "clarity_score": 15,
+                "breakdown": {
+                    "total_questions": 0,
+                    "response_attempts": 0,
+                    "on_topic_answers": 0,
+                    "skipped": 0,
+                    "silent": 0,
+                    "irrelevant": 0,
+                    "avg_response_time": 0,
+                    "repeat_requests": 0
+                }
+            }
+        
+        # === WILLINGNESS (30 pts) ===
+        # Response attempts = answered + irrelevant (they tried to answer)
+        response_attempts = answered + irrelevant
+        willingness_rate = response_attempts / total if total > 0 else 0
+        willingness_score = willingness_rate * 30
+        
+        # === RELEVANCE (30 pts) ===
+        # Of the attempts, how many were on-topic?
+        relevance_rate = answered / response_attempts if response_attempts > 0 else 0
+        relevance_score = relevance_rate * 30
+        
+        # === RESPONSIVENESS (25 pts) ===
+        # Based on average response time
+        avg_time = 0
+        if response_times:
+            avg_time = sum(response_times) / len(response_times)
+            if avg_time < 3:
+                responsiveness_score = 25
+            elif avg_time < 5:
+                responsiveness_score = 20
+            elif avg_time < 8:
+                responsiveness_score = 15
+            elif avg_time < 12:
+                responsiveness_score = 10
+            else:
+                responsiveness_score = 5
+        else:
+            responsiveness_score = 15  # Default if no timing data
+        
+        # === CLARITY (15 pts) ===
+        # Penalty: 3 points per repeat request, max 15
+        clarity_penalty = min(repeats * 3, 15)
+        clarity_score = 15 - clarity_penalty
+        
+        # === TOTAL ===
+        total_score = willingness_score + relevance_score + responsiveness_score + clarity_score
+        total_score = min(100, max(0, total_score))  # Clamp to 0-100
+        
+        return {
+            "total_score": round(total_score, 1),
+            "willingness_score": round(willingness_score, 1),
+            "relevance_score": round(relevance_score, 1),
+            "responsiveness_score": round(responsiveness_score, 1),
+            "clarity_score": round(clarity_score, 1),
+            "breakdown": {
+                "total_questions": total,
+                "response_attempts": response_attempts,
+                "on_topic_answers": answered,
+                "skipped": skipped,
+                "silent": silent,
+                "irrelevant": irrelevant,
+                "avg_response_time": round(avg_time, 1) if response_times else 0,
+                "repeat_requests": repeats
+            }
+        }
+
+    async def _send_comm_score_update(self, session_data, event_type: str = "update"):
+        """Send real-time communication score update to frontend."""
+        try:
+            comm_score = self.calculate_communication_score(session_data)
+            session_data.live_communication_score = comm_score["total_score"]
+            
+            await self._send_quick_message(session_data, {
+                "type": "communication_score_update",
+                "score": comm_score["total_score"],
+                "breakdown": comm_score,
+                "event": event_type
+            })
+            
+            logger.info(f"📊 Communication Score: {comm_score['total_score']}/100 ({event_type})")
+            logger.info(f"   └─ Willingness: {comm_score['willingness_score']}/30, Relevance: {comm_score['relevance_score']}/30, Responsiveness: {comm_score['responsiveness_score']}/25, Clarity: {comm_score['clarity_score']}/15")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to send comm score update: {e}")
+
     # ============================================================================
     # ✅ IMPROVED: Dynamic silence response generation with GENTLE prompts
     # ============================================================================
@@ -284,14 +401,26 @@ class UltraFastSessionManagerWithSilenceHandling:
             )
             extended_question = (extended_question or "").strip()
             
-            # Retry if too short or seems like a repeat
+            #retry too short or seems like a repeat
             attempts = 0
-            max_attempts = 5  # Increased from 3
+            max_attempts = 3  # ✅ FIX 3A: Reduced from 5 to 3
+            
+            # ✅ FIX 3A: Question categories for variety
+            import random
+            question_categories = [
+                "transaction codes", "troubleshooting steps", "security considerations",
+                "performance optimization", "real-world scenarios", "configuration steps",
+                "prerequisites", "error handling", "monitoring approaches"
+            ]
+            used_cats = getattr(session_data, '_used_q_categories', [])
+            avail_cats = [c for c in question_categories if c not in used_cats[-3:]]
+            cat_hint = f" Focus on: {random.choice(avail_cats)}." if avail_cats and attempts > 0 else ""
+            
             while attempts < max_attempts:
                 is_too_short = len(extended_question.split()) < 8
                 is_repeat = any(
                     self._is_similar_question(q, extended_question) 
-                    for q in asked_questions[-15:]  # Check last 15 questions (increased from 10)
+                    for q in asked_questions[-10:]  # ✅ FIX 3A: Reduced from 15 to 10
                 )
                 
                 if not extended_question or is_too_short or is_repeat:
@@ -301,9 +430,9 @@ class UltraFastSessionManagerWithSilenceHandling:
                     else:
                         logger.warning(f"⚠️ Extended question attempt {attempts} failed - retrying...")
                     
-                    # Add variety hint to prompt on retries
-                    variety_hint = f"\n\nIMPORTANT: Generate a COMPLETELY DIFFERENT question. Avoid asking about: {', '.join(asked_questions[-5:])}" if attempts > 1 else ""
-                    
+                    # ✅ FIX 3A: Category-based variety hint
+                    variety_hint = f"\\n\\nIMPORTANT: Generate a COMPLETELY DIFFERENT question.{cat_hint} Avoid: {', '.join([q[:25] for q in asked_questions[-3:]])}" if attempts > 0 else ""
+
                     extended_prompt_with_hint = prompts.generate_extended_web_question(
                         topic=main_topic,
                         already_asked=asked_questions,
@@ -333,16 +462,16 @@ class UltraFastSessionManagerWithSilenceHandling:
         except Exception as e:
             logger.error(f"❌ Extended question generation error: {e}", exc_info=True)
             return None
-
+    
     def _is_similar_question(self, q1: str, q2: str) -> bool:
-        """Check if two questions are too similar (stricter word overlap check)."""
+        """Check if two questions are too similar using 85% word overlap threshold."""
         if not q1 or not q2:
             return False
         
         # Normalize - remove punctuation and lowercase
         import re
-        q1_clean = re.sub(r'[^\w\s]', '', q1.lower())
-        q2_clean = re.sub(r'[^\w\s]', '', q2.lower())
+        q1_clean = re.sub(r'[^\\w\\s]', '', q1.lower())
+        q2_clean = re.sub(r'[^\\w\\s]', '', q2.lower())
         
         words1 = set(q1_clean.split())
         words2 = set(q2_clean.split())
@@ -352,7 +481,8 @@ class UltraFastSessionManagerWithSilenceHandling:
             'what', 'is', 'are', 'the', 'a', 'an', 'how', 'do', 'does', 'for', 'to', 
             'in', 'of', 'and', 'when', 'can', 'you', 'be', 'should', 'would', 'could',
             'sap', 'client', 'system', 'that', 'this', 'with', 'from', 'or', 'on',
-            'best', 'practice', 'key', 'steps', 'during', 'performing', 'ensure'
+            'best', 'practice', 'key', 'steps', 'during', 'performing', 'ensure',
+            'explain', 'describe', 'tell', 'me', 'about', 'please'
         }
         words1 = words1 - stop_words
         words2 = words2 - stop_words
@@ -360,22 +490,28 @@ class UltraFastSessionManagerWithSilenceHandling:
         if not words1 or not words2:
             return False
         
-        # Calculate overlap
+        # ✅ FIX 3B: Use 85% threshold for duplicate detection
         overlap = len(words1 & words2)
         min_len = min(len(words1), len(words2))
+        max_len = max(len(words1), len(words2))
         
-        # If more than 40% overlap (stricter than before), consider similar
-        # Also check if the remaining meaningful words are very similar
-        if min_len > 0:
-            overlap_ratio = overlap / min_len
-            if overlap_ratio > 0.4:  # Changed from 0.6 to 0.4 (stricter)
-                return True
+        if min_len == 0:
+            return False
         
-        # Additional check: if questions share 3+ meaningful words, flag as similar
-        if overlap >= 3:
+        overlap_ratio = overlap / min_len
+        
+        # Primary: 85% overlap = too similar
+        if overlap_ratio >= 0.85:
+            logger.debug(f"🔍 Duplicate: {overlap_ratio:.0%} overlap")
+            return True
+        
+        # Secondary: 4+ shared words AND >50% = similar
+        if overlap >= 4 and overlap_ratio > 0.5:
+            logger.debug(f"🔍 Duplicate: {overlap} words at {overlap_ratio:.0%}")
             return True
         
         return False
+
     
     def should_continue_session(self, session_data) -> bool:
         """
@@ -498,6 +634,18 @@ class UltraFastSessionManagerWithSilenceHandling:
             session_data.greeting_end_ts = None
             session_data.last_silence_response_ts = 0  # ✅ Initialize cooldown timestamp (for awaiting_user only)
 
+            # === REAL-TIME COMMUNICATION SCORE TRACKING ===
+            session_data.response_times = []  # List of response delays in seconds
+            session_data.last_question_end_ts = None  # When AI finished asking question
+            session_data.comm_stats = {
+                "total_questions": 0,      # Total technical questions asked
+                "answered": 0,             # Questions with substantive answers
+                "skipped": 0,              # Explicit skips ("I don't know")
+                "silent": 0,               # No response (silence)
+                "irrelevant": 0,           # Off-topic answers
+                "repeat_requests": 0,      # Asked to repeat question
+            }
+            session_data.live_communication_score = 100  # Start at 100, update in real-time
             # time limits
             SESSION_MAX_SECONDS = getattr(config, "SESSION_MAX_SECONDS", 15 * 60)
             SESSION_SOFT_CUTOFF_SECONDS = getattr(config, "SESSION_SOFT_CUTOFF_SECONDS", 2 * 60)
@@ -827,15 +975,20 @@ class UltraFastSessionManagerWithSilenceHandling:
             closing_text = closing_text or " "
 
             # Try evaluation (best-effort)
-            evaluation, score = None, None
+            evaluation_text, score, detailed_evaluation = None, None, None
             try:
-                evaluation, score = await self.conversation_manager.generate_fast_evaluation(session_data)
+                evaluation_text, score, detailed_evaluation = await self.conversation_manager.generate_fast_evaluation(session_data)
+                
+                # ✅ FIX: Store detailed_evaluation on session_data
+                session_data.detailed_evaluation = detailed_evaluation
+                
             except Exception as e_eval:
                 logger.error("Evaluation generation error (time-cutoff): %s", e_eval)
+            
 
             try:
-                if evaluation is not None and score is not None:
-                    saved = await self.db_manager.save_session_result_fast(session_data, evaluation, score)
+                if evaluation_text is not None and score is not None:
+                    saved = await self.db_manager.save_session_result_fast(session_data, evaluation_text, score)
                     if not saved:
                         logger.error("Save (time-cutoff) failed for %s", session_data.session_id)
             except Exception as e_save:
@@ -995,7 +1148,20 @@ class UltraFastSessionManagerWithSilenceHandling:
                 if old_count > 0:
                     session_data.silence_response_count = 0
                     logger.info(f"🔄 User spoke - resetting backend silence counter from {old_count} to 0")
-
+                
+                # === TRACK RESPONSE TIME FOR COMMUNICATION SCORE ===
+                last_q_ts = getattr(session_data, 'last_question_end_ts', None)
+                if last_q_ts and session_data.current_stage == SessionStage.TECHNICAL:
+                    response_delay = time.time() - last_q_ts
+                    # Only count reasonable delays (ignore if > 60s - probably a different context)
+                    if 0 < response_delay < 60:
+                        if not hasattr(session_data, 'response_times'):
+                            session_data.response_times = []
+                        session_data.response_times.append(response_delay)
+                        logger.info(f"⏱️ Response time recorded: {response_delay:.1f}s (avg: {sum(session_data.response_times)/len(session_data.response_times):.1f}s)")
+                    # Reset to avoid double-counting
+                    session_data.last_question_end_ts = None
+            
             # ---- PATH A: silence chunk → skip STT, use DYNAMIC response ----
             if is_silence_chunk:
                 session_data.consecutive_silence_chunks += 1
@@ -1127,6 +1293,11 @@ class UltraFastSessionManagerWithSilenceHandling:
                         break
                                 
                     if last_question:
+                        # === UPDATE COMMUNICATION STATS: REPEAT REQUEST (5D) ===
+                        if not hasattr(session_data, 'comm_stats'):
+                            session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
+                        session_data.comm_stats["repeat_requests"] += 1
+                        await self._send_comm_score_update(session_data, "repeat_request")
                         # ✅ NEW: Extract only the question part, removing acknowledgments
                         last_question_clean = self._extract_question_only(last_question)
                         
@@ -1223,6 +1394,13 @@ class UltraFastSessionManagerWithSilenceHandling:
             skip_phrases = ["skip", "i don't know", "dont know", "i do not know", "can't answer", "cant answer", "cannot answer", "not sure", "no idea", "don't have", "dont have"]
             if transcript and any(phrase in transcript.lower() for phrase in skip_phrases):
                 logger.info("⏩ User explicitly requested to skip the question")
+
+                # === UPDATE COMMUNICATION STATS: SKIPPED (5B) ===
+                if not hasattr(session_data, 'comm_stats'):
+                    session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
+                session_data.comm_stats["total_questions"] += 1
+                session_data.comm_stats["skipped"] += 1
+                await self._send_comm_score_update(session_data, "skipped")
                 
                 # Generate brief "That's okay" acknowledgment
                 skip_acknowledgments = [
@@ -1490,6 +1668,13 @@ class UltraFastSessionManagerWithSilenceHandling:
                             
                             if "IRRELEVANT" in relevance_check:
                                 logger.info(f"⚠️ LLM detected irrelevant answer: '{transcript}' for question: '{last_question}'")
+
+                                # === UPDATE COMMUNICATION STATS: IRRELEVANT (5C) ===
+                                if not hasattr(session_data, 'comm_stats'):
+                                    session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
+                                session_data.comm_stats["total_questions"] += 1
+                                session_data.comm_stats["irrelevant"] += 1
+                                await self._send_comm_score_update(session_data, "irrelevant")
                                 
                                 # ✅ IMPROVED: Generate polite redirect instead of encouragement
                                 
@@ -1766,8 +1951,17 @@ class UltraFastSessionManagerWithSilenceHandling:
                     session_data.greeting_count = getattr(session_data, "greeting_count", 0) + 1
                     logger.info(f"📊 Greeting count incremented to {session_data.greeting_count}")
 
+                # === UPDATE COMMUNICATION STATS: ANSWERED (5A) ===
+                if session_data.current_stage == SessionStage.TECHNICAL:
+                    if not hasattr(session_data, 'comm_stats'):
+                        session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
+                    session_data.comm_stats["total_questions"] += 1
+                    session_data.comm_stats["answered"] += 1
+                    await self._send_comm_score_update(session_data, "answered")
+
                 await self._update_session_state_fast(session_data)
                 return
+                
             elif soft_cutoff and now_ts >= soft_cutoff:
                 concept = session_data.current_concept or "unknown"
                 is_followup = getattr(session_data, "_last_question_followup", False)
@@ -2291,6 +2485,14 @@ class UltraFastSessionManagerWithSilenceHandling:
                 text = await self.generate_dynamic_silence_response(session_data, silence_data)
 
                 logger.info(f"📝 Generated silence text: '{text}'")
+                # === UPDATE COMMUNICATION STATS: SILENT (5E) ===
+                if session_data.current_stage == SessionStage.TECHNICAL:
+                    if not hasattr(session_data, 'comm_stats'):
+                        session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
+                    # Only count if a question was asked
+                    if session_data.comm_stats["total_questions"] > 0 or getattr(session_data, 'last_question_end_ts', None):
+                        session_data.comm_stats["silent"] += 1
+                        await self._send_comm_score_update(session_data, "silent")
 
                 # ✅ CRITICAL: Check if this is the 5th silence - if so, mark session as ENDING
                 if session_data.silence_response_count >= 5:
@@ -2547,7 +2749,9 @@ class UltraFastSessionManagerWithSilenceHandling:
             except Exception as qa_err:
                 logger.error(f"Q&A save failed: {qa_err}")
 
-            evaluation, score = await self.conversation_manager.generate_fast_evaluation(session_data)
+            evaluation_text, score, detailed_evaluation = await self.conversation_manager.generate_fast_evaluation(session_data)
+            # ✅ FIX: Store detailed_evaluation on session_data so it gets saved to MongoDB
+            session_data.detailed_evaluation = detailed_evaluation
             save_success = await self.db_manager.save_session_result_fast(session_data, evaluation, score)
             if not save_success:
                 logger.error("Failed to save session %s", session_data.session_id)
@@ -2557,6 +2761,7 @@ class UltraFastSessionManagerWithSilenceHandling:
                 "text": completion_message,
                 "evaluation": evaluation,
                 "score": score,
+                "detailed_evaluation": detailed_evaluation,
                 "pdf_url": f"/download_results/{session_data.session_id}",
                 "status": "complete",
                 "enable_new_session": True,
@@ -2631,6 +2836,15 @@ class UltraFastSessionManagerWithSilenceHandling:
             
             logger.info(f"🎬 Finalizing session - Duration: {duration_minutes:.1f}m, Questions: {total_questions}, Extended: {extended_mode_used}")
             
+             # === GET FINAL COMMUNICATION SCORE (PATCH 6) ===
+            final_comm_score = self.calculate_communication_score(session_data)
+            session_data.final_communication_score = final_comm_score
+            logger.info(f"📊 Final Communication Score: {final_comm_score['total_score']}/100")
+            logger.info(f"   └─ Willingness: {final_comm_score['willingness_score']}/30")
+            logger.info(f"   └─ Relevance: {final_comm_score['relevance_score']}/30")
+            logger.info(f"   └─ Responsiveness: {final_comm_score['responsiveness_score']}/25")
+            logger.info(f"   └─ Clarity: {final_comm_score['clarity_score']}/15")
+
             # Generate formal closing message
             closing_prompt = prompts.formal_session_closing(session_context)
             loop = asyncio.get_event_loop()
@@ -2674,7 +2888,12 @@ class UltraFastSessionManagerWithSilenceHandling:
             evaluation_text, score, detailed_evaluation = None, None, None
             try:
                 evaluation_text, score, detailed_evaluation = await self.conversation_manager.generate_fast_evaluation(session_data)
-                
+                # ✅ FIX: Store detailed_evaluation on session_data so it gets saved to MongoDB
+                session_data.detailed_evaluation = detailed_evaluation
+                #override communication score with real-time calculated value
+                if detailed_evaluation and final_comm_score:
+                    detailed_evaluation["communication_score"] = final_comm_score["total_score"]
+                    detailed_evaluation["communication_breakdown"] = final_comm_score
                 # Save to database
                 save_success = await self.db_manager.save_session_result_fast(session_data, evaluation_text, score)
                 if not save_success:
@@ -2701,6 +2920,12 @@ class UltraFastSessionManagerWithSilenceHandling:
                 evaluation_text = "Evaluation encountered an error."
                 score = 50.0
             
+            # ✅ FIX 2: Send stop_audio FIRST to clear frontend queue
+            await self._send_quick_message(session_data, {
+                "type": "stop_audio",
+                "reason": "session_ending"
+            })
+            await asyncio.sleep(0.2)  # Brief delay for frontend to clear queue
             # ✅ Send closing message with DETAILED evaluation
             await self._send_quick_message(session_data, {
                 "type": "conversation_end",
@@ -2708,6 +2933,7 @@ class UltraFastSessionManagerWithSilenceHandling:
                 "evaluation": evaluation_text,
                 "score": score,
                 "detailed_evaluation": detailed_evaluation,  # ✅ NEW: Include full evaluation
+                "communication_score": final_comm_score,
                 "pdf_url": f"/download_results/{session_data.session_id}",
                 "status": "complete",
                 "enable_new_session": True,
@@ -2729,9 +2955,9 @@ class UltraFastSessionManagerWithSilenceHandling:
                     await self._send_quick_message(session_data, {
                         "type": "audio_chunk",
                         "audio": audio_chunk.hex(),
-                        "status": "complete",
+                        "status": "closing",
                     })
-            await self._send_quick_message(session_data, {"type": "audio_end", "status": "complete"})
+            await self._send_quick_message(session_data, {"type": "audio_end", "status": "closing"})
             
         except Exception as e:
             logger.error("Formal session finalization error: %s", e)
@@ -2784,6 +3010,10 @@ class UltraFastSessionManagerWithSilenceHandling:
                     chunk_count += 1
 
             await self._send_quick_message(session_data, {"type": "audio_end", "status": session_data.current_stage.value})
+            # === TRACK QUESTION END TIME FOR RESPONSIVENESS ===
+            if session_data.current_stage == SessionStage.TECHNICAL:
+                session_data.last_question_end_ts = time.time()
+                logger.info(f"⏱️ Question end timestamp recorded")
             session_data.last_ai_audio_ts = time.time()
             
             # === Enable silence detection after greeting ends ===
@@ -3144,9 +3374,10 @@ def generate_comprehensive_pdf_report(result: dict, detailed_evaluation: dict, s
         
         story.append(Paragraph("OVERALL SCORE", header_style))
         story.append(Paragraph(f"{overall_score}/100", score_display_style))
-        story.append(Paragraph(f"Grade: {grade}", ParagraphStyle('Grade', alignment=TA_CENTER, fontSize=24, textColor=HexColor(score_color))))
+        story.append(Spacer(1, 15))  # ✅ FIX 1: Spacer prevents score/grade overlap
+        story.append(Paragraph(f"Grade: {grade}", ParagraphStyle('Grade', alignment=TA_CENTER, fontSize=24, textColor=HexColor(score_color), spaceBefore=10)))
         story.append(Spacer(1, 20))
-        
+
         # Summary
         summary = detailed_evaluation.get("summary", "No summary available.")
         story.append(Paragraph(summary, ParagraphStyle('Summary', alignment=TA_CENTER, fontSize=12, textColor=HexColor('#4a5568'), leading=16)))
@@ -3775,7 +4006,14 @@ async def enhanced_websocket_endpoint(websocket: WebSocket, session_id: str):
                 session_data.greeting_end_ts = time.time()
                 session_data.greeting_count = 1
                 logger.info(f"✅ Initial greeting sent, greeting_count = 1")
-
+                # === SEND INITIAL COMMUNICATION SCORE (PATCH 7) ===
+                initial_comm_score = session_manager.calculate_communication_score(session_data)
+                await websocket.send_text(json.dumps({
+                    "type": "communication_score_update",
+                    "score": initial_comm_score["total_score"],
+                    "breakdown": initial_comm_score,
+                    "is_initial": True
+                }))
 
 
             except Exception as tts_error:
