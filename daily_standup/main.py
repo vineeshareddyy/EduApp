@@ -9,7 +9,8 @@ import time
 import uuid
 import logging
 import io
-from typing import Dict, Optional, Any
+from pydantic import BaseModel
+from typing import Dict, Optional, Any, List
 from pathlib import Path
 from reportlab.lib.pagesizes import LETTER, A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, HRFlowable
@@ -37,6 +38,31 @@ from core.prompts import DailyStandupPrompts as prompts
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# FEEDBACK DATA MODEL
+# =============================================================================
+
+class FeedbackData(BaseModel):
+    """Pydantic model for feedback submission"""
+    overallExperience: int = 0
+    audioQuality: int = 0
+    questionClarity: int = 0
+    systemResponsiveness: int = 0
+    technicalIssues: List[str] = []
+    otherIssues: str = ""
+    suggestions: str = ""
+    wouldRecommend: str = ""
+    difficultyLevel: str = ""
+    submitted_at: Optional[str] = None
+
+class FeedbackPayload(BaseModel):
+    """Complete feedback submission payload"""
+    session_id: str
+    student_id: Optional[int] = None
+    student_name: Optional[str] = None
+    feedback: FeedbackData
+    session_duration: Optional[int] = None
 
 # =============================================================================
 # MODULE-LEVEL Q&A SAVE FUNCTION
@@ -199,6 +225,97 @@ def save_qa_to_mongodb(session_id: str, student_id: int, student_name: str,
         import traceback
         traceback.print_exc()
         return False
+
+# =============================================================================
+# FEEDBACK SAVE FUNCTION - Add this near save_qa_to_mongodb function
+# =============================================================================
+
+def save_feedback_to_mongodb(payload: dict) -> bool:
+    """
+    Save user feedback to MongoDB collection (ml_notes.daily_standup_results).
+    
+    This stores feedback as a document with type="session_feedback" in the SAME
+    collection as conversation (type="qa_session") and evaluation (type="session_result")
+    documents, allowing all session data to be queried together.
+    """
+    try:
+        from pymongo import MongoClient
+        from urllib.parse import quote_plus
+        from datetime import datetime
+        
+        encoded_pass = quote_plus("LT@connect25")
+        connection_string = (
+            f"mongodb://connectly:{encoded_pass}"
+            f"@192.168.48.201:27017/ml_notes"
+            f"?authSource=admin"
+        )
+        
+        client = MongoClient(connection_string, serverSelectionTimeoutMS=10000)
+        db = client["ml_notes"]
+        
+        # ✅ CHANGED: Use daily_standup_results instead of daily_standup_feedback
+        collection = db["daily_standup_results"]
+        
+        # Build feedback document
+        feedback_document = {
+            "session_id": payload.get("session_id"),
+            "student_id": payload.get("student_id"),
+            "student_name": payload.get("student_name"),
+            "session_duration": payload.get("session_duration"),
+            
+            # Feedback ratings (1-5 stars)
+            "ratings": {
+                "overall_experience": payload.get("feedback", {}).get("overallExperience", 0),
+                "audio_quality": payload.get("feedback", {}).get("audioQuality", 0),
+                "question_clarity": payload.get("feedback", {}).get("questionClarity", 0),
+                "system_responsiveness": payload.get("feedback", {}).get("systemResponsiveness", 0),
+            },
+            
+            # Technical issues (multi-select)
+            "technical_issues": payload.get("feedback", {}).get("technicalIssues", []),
+            "other_issues": payload.get("feedback", {}).get("otherIssues", ""),
+            
+            # User input
+            "suggestions": payload.get("feedback", {}).get("suggestions", ""),
+            "would_recommend": payload.get("feedback", {}).get("wouldRecommend", ""),
+            "difficulty_level": payload.get("feedback", {}).get("difficultyLevel", ""),
+            
+            # Metadata
+            "submitted_at": payload.get("feedback", {}).get("submitted_at") or datetime.utcnow().isoformat(),
+            "created_at": datetime.utcnow(),
+            "timestamp": datetime.now(),  # For consistency with other documents
+            
+            # ✅ CRITICAL: Type field to distinguish from other documents
+            "type": "session_feedback"
+        }
+        
+        # Calculate average rating
+        ratings = feedback_document["ratings"]
+        valid_ratings = [r for r in ratings.values() if r > 0]
+        feedback_document["average_rating"] = (
+            sum(valid_ratings) / len(valid_ratings) if valid_ratings else 0
+        )
+        
+        result = collection.insert_one(feedback_document)
+        
+        if result.inserted_id:
+            logger.info(f"✅ Feedback saved to daily_standup_results for session {payload.get('session_id')}")
+            logger.info(f"   └─ Document type: session_feedback")
+            logger.info(f"   └─ Average rating: {feedback_document['average_rating']:.1f}/5")
+            logger.info(f"   └─ Technical issues: {len(feedback_document['technical_issues'])} reported")
+            client.close()
+            return True
+        else:
+            logger.error("❌ Failed to save feedback document")
+            client.close()
+            return False
+        
+    except Exception as e:
+        logger.error(f"❌ Feedback save error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 # =============================================================================
 # ENHANCED SESSION MANAGER WITH SILENCE DETECTION - COMPLETE VERSION
 # =============================================================================
@@ -3628,6 +3745,269 @@ def get_rating(score: float) -> str:
         return "Needs Improvement"
     else:
         return "Poor"
+
+@app.post("/submit_feedback")
+async def submit_feedback(payload: FeedbackPayload):
+    """
+    Submit user feedback after standup session completion.
+    
+    Expected payload:
+    {
+        "session_id": "uuid-string",
+        "student_id": 123,
+        "student_name": "John Doe",
+        "feedback": {
+            "overallExperience": 4,
+            "audioQuality": 5,
+            "questionClarity": 4,
+            "systemResponsiveness": 3,
+            "technicalIssues": ["Delayed responses"],
+            "otherIssues": "Sometimes audio cut out",
+            "suggestions": "Improve response time",
+            "wouldRecommend": "yes",
+            "difficultyLevel": "moderate",
+            "submitted_at": "2025-01-15T10:30:00.000Z"
+        },
+        "session_duration": 900
+    }
+    """
+    try:
+        logger.info(f"📝 Receiving feedback for session: {payload.session_id}")
+        
+        # Convert Pydantic model to dict
+        payload_dict = payload.dict()
+        
+        # Save to MongoDB
+        success = save_feedback_to_mongodb(payload_dict)
+        
+        if success:
+            return {
+                "status": "success",
+                "message": "Feedback submitted successfully",
+                "session_id": payload.session_id,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        else:
+            raise HTTPException(
+                status_code=500, 
+                detail="Failed to save feedback to database"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Feedback submission error: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Feedback submission failed: {str(e)}"
+        )
+
+
+# =============================================================================
+# OPTIONAL: Get feedback statistics endpoint
+# =============================================================================
+
+@app.get("/feedback_stats")
+async def get_feedback_stats():
+    """Get aggregated feedback statistics from daily_standup_results collection."""
+    try:
+        from pymongo import MongoClient
+        from urllib.parse import quote_plus
+        
+        encoded_pass = quote_plus("LT@connect25")
+        connection_string = (
+            f"mongodb://connectly:{encoded_pass}"
+            f"@192.168.48.201:27017/ml_notes"
+            f"?authSource=admin"
+        )
+        
+        client = MongoClient(connection_string, serverSelectionTimeoutMS=10000)
+        db = client["ml_notes"]
+        
+        # ✅ CHANGED: Query from daily_standup_results with type filter
+        collection = db["daily_standup_results"]
+        
+        # Aggregate statistics - filter by type="session_feedback"
+        pipeline = [
+            {
+                "$match": {"type": "session_feedback"}  # ✅ Filter only feedback documents
+            },
+            {
+                "$group": {
+                    "_id": None,
+                    "total_feedback": {"$sum": 1},
+                    "avg_overall": {"$avg": "$ratings.overall_experience"},
+                    "avg_audio": {"$avg": "$ratings.audio_quality"},
+                    "avg_clarity": {"$avg": "$ratings.question_clarity"},
+                    "avg_responsiveness": {"$avg": "$ratings.system_responsiveness"},
+                    "avg_rating": {"$avg": "$average_rating"},
+                    "would_recommend_yes": {
+                        "$sum": {"$cond": [{"$eq": ["$would_recommend", "yes"]}, 1, 0]}
+                    },
+                    "would_recommend_maybe": {
+                        "$sum": {"$cond": [{"$eq": ["$would_recommend", "maybe"]}, 1, 0]}
+                    },
+                    "would_recommend_no": {
+                        "$sum": {"$cond": [{"$eq": ["$would_recommend", "no"]}, 1, 0]}
+                    },
+                }
+            }
+        ]
+        
+        result = list(collection.aggregate(pipeline))
+        
+        if result:
+            stats = result[0]
+            del stats["_id"]
+            
+            # Round averages
+            for key in ["avg_overall", "avg_audio", "avg_clarity", "avg_responsiveness", "avg_rating"]:
+                if stats.get(key):
+                    stats[key] = round(stats[key], 2)
+            
+            # Get common technical issues
+            issues_pipeline = [
+                {"$match": {"type": "session_feedback"}},  # ✅ Filter only feedback
+                {"$unwind": "$technical_issues"},
+                {"$group": {"_id": "$technical_issues", "count": {"$sum": 1}}},
+                {"$sort": {"count": -1}},
+                {"$limit": 10}
+            ]
+            common_issues = list(collection.aggregate(issues_pipeline))
+            stats["common_technical_issues"] = [
+                {"issue": item["_id"], "count": item["count"]} 
+                for item in common_issues
+            ]
+            
+            client.close()
+            return stats
+        
+        client.close()
+        return {
+            "total_feedback": 0,
+            "message": "No feedback data available yet"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Feedback stats error: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to get feedback stats: {str(e)}"
+        )
+
+# =============================================================================
+# OPTIONAL: Get feedback for specific session
+# =============================================================================
+
+@app.get("/feedback/{session_id}")
+async def get_session_feedback(session_id: str):
+    """Get feedback for a specific session from daily_standup_results collection."""
+    try:
+        from pymongo import MongoClient
+        from urllib.parse import quote_plus
+        
+        encoded_pass = quote_plus("LT@connect25")
+        connection_string = (
+            f"mongodb://connectly:{encoded_pass}"
+            f"@192.168.48.201:27017/ml_notes"
+            f"?authSource=admin"
+        )
+        
+        client = MongoClient(connection_string, serverSelectionTimeoutMS=10000)
+        db = client["ml_notes"]
+        
+        # ✅ CHANGED: Query from daily_standup_results with type filter
+        collection = db["daily_standup_results"]
+        
+        # Find feedback document for this session
+        feedback = collection.find_one({
+            "session_id": session_id,
+            "type": "session_feedback"  # ✅ Filter by type
+        })
+        
+        client.close()
+        
+        if feedback:
+            # Convert ObjectId to string
+            feedback["_id"] = str(feedback["_id"])
+            return feedback
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No feedback found for session {session_id}"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Get feedback error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get feedback: {str(e)}"
+        )
+
+@app.get("/session_documents/{session_id}")
+async def get_all_session_documents(session_id: str):
+    """
+    Get all documents for a session from daily_standup_results collection.
+    Returns conversation (qa_session), evaluation (session_result), and feedback (session_feedback).
+    """
+    try:
+        from pymongo import MongoClient
+        from urllib.parse import quote_plus
+        
+        encoded_pass = quote_plus("LT@connect25")
+        connection_string = (
+            f"mongodb://connectly:{encoded_pass}"
+            f"@192.168.48.201:27017/ml_notes"
+            f"?authSource=admin"
+        )
+        
+        client = MongoClient(connection_string, serverSelectionTimeoutMS=10000)
+        db = client["ml_notes"]
+        collection = db["daily_standup_results"]
+        
+        # Find all documents for this session
+        documents = list(collection.find({"session_id": session_id}))
+        
+        client.close()
+        
+        if not documents:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No documents found for session {session_id}"
+            )
+        
+        # Organize by type
+        result = {
+            "session_id": session_id,
+            "conversation": None,      # type: qa_session
+            "evaluation": None,        # type: session_result
+            "feedback": None,          # type: session_feedback
+            "document_count": len(documents)
+        }
+        
+        for doc in documents:
+            doc["_id"] = str(doc["_id"])
+            doc_type = doc.get("type", "unknown")
+            
+            if doc_type == "qa_session":
+                result["conversation"] = doc
+            elif doc_type == "session_result":
+                result["evaluation"] = doc
+            elif doc_type == "session_feedback":
+                result["feedback"] = doc
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Get session documents error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get session documents: {str(e)}"
+        )
 
 @app.get("/download_results/{session_id}")
 async def download_results_fast(session_id: str):
