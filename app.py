@@ -97,6 +97,25 @@ for prefix, import_spec in sub_apps.items():
         logger.error(f"❌ Failed to mount `{prefix}` sub-app: {exc}")
         logger.error(f"   Module: {module_path}, Attribute: {attr}")
 
+# Initialize biometric services for daily_standup sub-app
+@app.on_event("startup")
+async def init_biometric_for_daily_standup():
+    try:
+        from core.biometric_auth import init_biometric_services
+        init_biometric_services(
+            mongo_host="192.168.48.201",
+            mongo_port=27017,
+            db_name="connectlydb",
+            username="connectly",
+            password="LT@connect25",
+            auth_source="admin",
+            max_voice_warnings=3
+        )
+        logger.info("✅ Biometric services initialized from main app")
+    except Exception as e:
+        logger.error(f"⚠️ Biometric init failed: {e}")
+
+
 # ——— Test endpoint to verify mounting ———
 @app.get("/debug/mounted-apps")
 async def debug_mounted_apps():

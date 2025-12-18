@@ -586,38 +586,56 @@ class DatabaseManager:
     # ------------------------------------------------------------------------
     # DAILY_STANDUP SPECIFIC
     # ------------------------------------------------------------------------
-    async def get_student_info_fast(self) -> Tuple[int, str, str, str]:
+    async def get_student_info_fast(self, student_id: int = None) -> Tuple[int, str, str, str]:
+        """Fetch student info - specific student if ID provided, random otherwise."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             self.client_manager.executor,
-            self._sync_get_student_info
+            self._sync_get_student_info,
+            student_id
         )
 
-    def _sync_get_student_info(self) -> Tuple[int, str, str, str]:
+    def _sync_get_student_info(self, student_id: int = None) -> Tuple[int, str, str, str]:
         try:
             conn = self.get_mysql_connection()
             cursor = conn.cursor(dictionary=True)
-            cursor.execute("""
-                SELECT ID, First_Name, Last_Name 
-                FROM tbl_Student 
-                WHERE ID IS NOT NULL AND First_Name IS NOT NULL AND Last_Name IS NOT NULL
-                ORDER BY RAND()
-                LIMIT 1
-            """)
+            
+            if student_id:
+                # ✅ Fetch specific logged-in student
+                logger.info(f"📋 Fetching student with ID: {student_id}")
+                cursor.execute("""
+                    SELECT ID, First_Name, Last_Name 
+                    FROM tbl_Student 
+                    WHERE ID = %s
+                    LIMIT 1
+                """, (student_id,))
+            else:
+                # ⚠️ Fallback to random (testing only)
+                logger.warning("⚠️ No student_id provided - random student mode")
+                cursor.execute("""
+                    SELECT ID, First_Name, Last_Name 
+                    FROM tbl_Student 
+                    WHERE ID IS NOT NULL AND First_Name IS NOT NULL AND Last_Name IS NOT NULL
+                    ORDER BY RAND()
+                    LIMIT 1
+                """)
+            
             row = cursor.fetchone()
             cursor.close()
             conn.close()
 
             if not row:
-                raise Exception("No valid student records found in tbl_Student")
+                error_msg = f"No student found with ID: {student_id}" if student_id else "No students found"
+                raise Exception(error_msg)
 
             session_key = f"SESSION_{int(time.time())}"
+            logger.info(f"✅ Found student: {row['First_Name']} {row['Last_Name']} (ID: {row['ID']})")
             return (row['ID'], row['First_Name'], row['Last_Name'], session_key)
 
         except Exception as e:
             logger.error(f"❌ Error fetching student info: {e}")
             raise
-
+    
     async def get_summary_fast(self) -> str:
         """Fetch summary from MongoDB (daily_standup style)"""
         try:

@@ -20,6 +20,17 @@ from reportlab.lib.units import inch
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from datetime import datetime
 import base64
+# Add these imports with your other imports:
+
+from fastapi import Form, File, UploadFile
+# Import biometric authentication services
+from core.biometric_auth import (
+    init_biometric_services,
+    get_biometric_service,
+    get_voice_tracker,
+    biometric_service,
+    voice_tracker
+)
 
 # Local imports - use package-relative, keep names intact
 from core import *
@@ -63,6 +74,31 @@ class FeedbackPayload(BaseModel):
     student_name: Optional[str] = None
     feedback: FeedbackData
     session_duration: Optional[int] = None
+
+class FaceVerificationRequest(BaseModel):
+    """Request model for face verification"""
+    student_code: str
+    image_base64: str
+
+class FaceVerificationResponse(BaseModel):
+    """Response model for face verification"""
+    verified: bool
+    similarity: float
+    threshold: float
+    error: Optional[str] = None
+    error_type: Optional[str] = None 
+    can_proceed: bool
+
+class VoiceVerificationResponse(BaseModel):
+    """Response model for voice verification"""
+    verified: bool
+    similarity: float
+    threshold: float
+    warning_count: int
+    should_terminate: bool
+    message: str
+    error: Optional[str] = None
+
 
 # =============================================================================
 # MODULE-LEVEL Q&A SAVE FUNCTION
@@ -707,12 +743,11 @@ class UltraFastSessionManagerWithSilenceHandling:
         
         return cleaned or text  # Return original if cleaning results in empty string
 
-
-    async def create_session_fast(self, websocket: Optional[Any] = None) -> SessionData:
+    async def create_session_fast(self, websocket: Optional[Any] = None, student_id: int = None) -> SessionData:
         session_id = str(uuid.uuid4())
         test_id = f"standup_{int(time.time())}"
         try:
-            student_info_task = asyncio.create_task(self.db_manager.get_student_info_fast())
+            student_info_task = asyncio.create_task(self.db_manager.get_student_info_fast(student_id=student_id))
             summary_task = asyncio.create_task(self.db_manager.get_summary_fast())
             student_id, first_name, last_name, session_key = await student_info_task
             summary = await summary_task
@@ -3236,6 +3271,20 @@ async def startup_event():
             logger.error("MongoDB connection test failed: %s", e)
             raise Exception(f"MongoDB connection failed: {e}")
 
+        try:
+            init_biometric_services(
+                mongo_host="192.168.48.201",
+                mongo_port=27017,
+                db_name="connectlydb",
+                username="connectly",
+                password="LT@connect25",
+                auth_source="admin",
+                max_voice_warnings=3
+            )
+            logger.info("✅ Biometric authentication services initialized")
+        except Exception as e:
+            logger.error(f"⚠️ Biometric services init failed (non-critical): {e}")
+
         logger.info("All database connections verified - silence detection ready")
     except Exception as e:
         logger.error("Startup failed: %s", e)
@@ -3244,10 +3293,21 @@ async def startup_event():
 async def shutdown_event():
     await shared_clients.close_connections()
     await session_manager.db_manager.close_connections()
+    # ✅ ADD THIS: Cleanup biometric services
+    if biometric_service:
+        biometric_service.disconnect()
     logger.info("Enhanced Daily Standup application shutting down")
 
 @app.get("/start_test")
-async def start_standup_session_fast():
+async def start_standup_session_fast(student_id: int = None):
+    """
+    Start standup session.
+    
+    Args:
+        student_id: Logged-in student's ID from ADMINORG_ROUGH
+    
+    Example: /start_test?student_id=38
+    """
     session_data = None
     try:
         logger.info("Starting enhanced standup session with silence detection...")
@@ -3257,7 +3317,8 @@ async def start_standup_session_fast():
                 await session_manager.remove_session(sid)
                 logger.info(f"🧹 Purged stale session {sid} before new start")
 
-        session_data = await session_manager.create_session_fast()
+        
+        session_data = await session_manager.create_session_fast(student_id=student_id)
 
         logger.info("Enhanced session created: %s", session_data.test_id)
         return {
@@ -4231,7 +4292,353 @@ async def enhanced_test_endpoint():
             "style": "interview_professional",
             "thanks_candidate": True,
             "mentions_next_session": True
+        },
+        "biometric_auth": {
+            "enabled": biometric_service is not None,
+            "face_verification": "pre_standup",
+            "voice_verification": "during_standup_every_45s",
+            "max_voice_warnings": 3
         }
+    }
+
+@app.post("/auth/verify-face", response_model=FaceVerificationResponse)
+async def verify_face_endpoint(request: FaceVerificationRequest):
+    """
+    Verify face before allowing standup entry.
+    
+    This endpoint should be called before the standup session starts.
+    Student must pass face verification to proceed.
+    
+    Args:
+        request: FaceVerificationRequest with student_code and base64 image
+        
+    Returns:
+        FaceVerificationResponse with verification result
+    """
+    from core.biometric_auth import get_biometric_service
+    
+    service = get_biometric_service()
+    if service is None:
+        raise HTTPException(
+            status_code=503, 
+            detail="Biometric authentication service not available"
+        )
+    
+    try:
+        # Decode base64 image
+        image_base64 = request.image_base64
+        
+        # Handle data URL format (data:image/jpeg;base64,...)
+        if "," in image_base64:
+            image_base64 = image_base64.split(",")[1]
+        
+        try:
+            image_data = base64.b64decode(image_base64)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}")
+        
+        # Verify face
+        result = service.verify_face(
+            student_code=request.student_code,
+            image_data=image_data
+        )
+        # ✅ ENHANCED LOGGING - Include error_type
+        logger.info(
+            f"🔐 Face verification for {request.student_code}: "
+            f"verified={result['verified']}, similarity={result['similarity']}, "
+            f"error_type={result.get('error_type')}, error={result.get('error')}"
+        )
+        
+               
+        return FaceVerificationResponse(
+            verified=result["verified"],
+            similarity=result["similarity"],
+            threshold=result["threshold"],
+            error=result["error"],
+            error_type=result.get("error_type"),
+            can_proceed=result["verified"]
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Face verification error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+'''@app.post("/auth/verify-voice/{session_id}")
+async def verify_voice_endpoint(
+    session_id: str,
+    student_code: str = Form(...),
+    audio: UploadFile = File(...)
+):
+    """
+    Verify voice during standup session.
+    
+    This endpoint is called periodically (every 45 seconds) during the standup
+    to verify the speaker is the registered student.
+    
+    Args:
+        session_id: Current standup session ID
+        student_code: Student's code for lookup
+        audio: Audio file (webm, wav, or mp3)
+        
+    Returns:
+        Voice verification result with warning count
+    """
+    from core.biometric_auth import get_biometric_service, get_voice_tracker
+    
+    service = get_biometric_service()
+    tracker = get_voice_tracker()
+    
+    if service is None or tracker is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Biometric authentication service not available"
+        )
+    
+    try:
+        # Read audio data
+        audio_data = await audio.read()
+        
+        if len(audio_data) < 1000:
+            raise HTTPException(status_code=400, detail="Audio file too small")
+        
+        # Determine audio format
+        audio_format = "webm"
+        if audio.filename:
+            if audio.filename.endswith(".wav"):
+                audio_format = "wav"
+            elif audio.filename.endswith(".mp3"):
+                audio_format = "mp3"
+            elif audio.filename.endswith(".webm"):
+                audio_format = "webm"
+        
+        # Verify voice
+        result = service.verify_voice(
+            student_code=student_code,
+            audio_data=audio_data,
+            audio_format=audio_format
+        )
+        
+        # Record verification result and get tracking status
+        tracking = tracker.record_verification(
+            session_id=session_id,
+            verified=result["verified"],
+            similarity=result["similarity"]
+        )
+        
+        logger.info(
+            f"🎤 Voice verification for {student_code} (session {session_id}): "
+            f"verified={result['verified']}, warnings={tracking['warning_count']}"
+        )
+        
+        return {
+            "verified": result["verified"],
+            "similarity": result["similarity"],
+            "threshold": result["threshold"],
+            "warning_count": tracking["warning_count"],
+            "should_terminate": tracking["should_terminate"],
+            "message": tracking["message"],
+            "error": result["error"]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Voice verification error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))'''
+
+@app.post("/auth/verify-voice/{session_id}")
+async def verify_voice_endpoint(
+    session_id: str,
+    student_code: str = Form(...),
+    audio: UploadFile = File(...)
+):
+    """Verify voice during standup session"""
+    service = get_biometric_service()
+    tracker = get_voice_tracker()
+    
+    if not service or not tracker:
+        raise HTTPException(status_code=503, detail="Biometric authentication service not available")
+    
+    try:
+        # Read audio data
+        audio_data = await audio.read()
+        
+        # Get file extension
+        audio_format = audio.filename.split('.')[-1] if audio.filename else "webm"
+        
+        # Verify voice
+        result = service.verify_voice(student_code, audio_data, audio_format)
+        
+        # ✅ FIX: Check for skip_warning flag from verification result
+        skip_warning = result.get("skip_warning", False)
+        
+        # Record in tracker (only if not skipping)
+        tracker_result = tracker.record_verification(
+            session_id, 
+            result["verified"], 
+            result["similarity"],
+            skip_warning=skip_warning  # ✅ Pass the flag
+        )
+        
+        logger.info(
+            f"🎤 Voice verification for {student_code} (session {session_id}): "
+            f"verified={result['verified']}, warnings={tracker_result['warning_count']}"
+        )
+        
+        return {
+            "verified": result["verified"],
+            "similarity": result["similarity"],
+            "threshold": result["threshold"],
+            "warning_count": tracker_result["warning_count"],
+            "should_terminate": tracker_result["should_terminate"],
+            "message": tracker_result["message"],
+            "error": result.get("error")
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Voice verification error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/auth/start-session/{session_id}")
+async def start_verification_session(session_id: str, student_code: str):
+    """
+    Initialize voice verification tracking for a new standup session.
+    
+    Call this after face verification succeeds and before the standup begins.
+    
+    Args:
+        session_id: New standup session ID
+        student_code: Student's code
+        
+    Returns:
+        Session initialization status
+    """
+    from core.biometric_auth import get_voice_tracker
+    
+    tracker = get_voice_tracker()
+    if tracker is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Voice tracking service not available"
+        )
+    
+    tracker.start_session(session_id, student_code)
+    
+    logger.info(f"🎬 Verification session started: {session_id} for student {student_code}")
+    
+    return {
+        "status": "success",
+        "session_id": session_id,
+        "student_code": student_code,
+        "message": "Voice verification tracking started",
+        "max_warnings": tracker.max_warnings
+    }
+
+
+@app.get("/auth/session-status/{session_id}")
+async def get_verification_session_status(session_id: str):
+    """
+    Get current voice verification status for a session.
+    
+    Args:
+        session_id: Standup session ID
+        
+    Returns:
+        Current warning count and termination status
+    """
+    from core.biometric_auth import get_voice_tracker
+    
+    tracker = get_voice_tracker()
+    if tracker is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Voice tracking service not available"
+        )
+    
+    status = tracker.get_session_status(session_id)
+    
+    if status is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    return {
+        "session_id": session_id,
+        "student_code": status["student_code"],
+        "warning_count": status["warning_count"],
+        "max_warnings": tracker.max_warnings,
+        "terminated": status["terminated"],
+        "termination_reason": status["termination_reason"],
+        "verification_count": len(status["verification_history"])
+    }
+
+
+@app.delete("/auth/end-session/{session_id}")
+async def end_verification_session(session_id: str):
+    """
+    Clean up voice verification tracking when standup ends.
+    
+    Call this when the standup session completes or is terminated.
+    
+    Args:
+        session_id: Standup session ID to clean up
+        
+    Returns:
+        Cleanup status
+    """
+    from core.biometric_auth import get_voice_tracker
+    
+    tracker = get_voice_tracker()
+    if tracker is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Voice tracking service not available"
+        )
+    
+    tracker.end_session(session_id)
+    
+    logger.info(f"🏁 Verification session ended: {session_id}")
+    
+    return {
+        "status": "success",
+        "session_id": session_id,
+        "message": "Voice verification tracking ended"
+    }
+
+
+@app.get("/auth/check-registration/{student_code}")
+async def check_biometric_registration(student_code: str):
+    """
+    Check if a student has registered biometric data.
+    
+    Use this to determine if face/voice verification should be required.
+    
+    Args:
+        student_code: Student's code
+        
+    Returns:
+        Registration status for face and voice
+    """
+    from core.biometric_auth import get_biometric_service
+    
+    service = get_biometric_service()
+    if service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Biometric authentication service not available"
+        )
+    
+    face_registered = service.get_stored_face_embedding(student_code) is not None
+    voice_registered = service.get_stored_voice_embedding(student_code) is not None
+    
+    return {
+        "student_code": student_code,
+        "face_registered": face_registered,
+        "voice_registered": voice_registered,
+        "both_registered": face_registered and voice_registered,
+        "can_require_verification": face_registered and voice_registered
     }
 
 @app.get("/health")
