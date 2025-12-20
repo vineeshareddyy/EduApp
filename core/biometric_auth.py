@@ -13,10 +13,299 @@ import logging
 import tempfile
 import os
 import base64
+import cv2
 from pymongo import MongoClient
 from urllib.parse import quote_plus
 from scipy.spatial.distance import cosine
 
+# ================== PERSON DETECTION (YOLO) ==================
+class PersonDetector:
+    """
+    ULTRA-SENSITIVE detection for exam security.
+    Uses YOLOv8 with aggressive settings to catch even tiny objects.
+    """
+    
+    def __init__(self):
+        self._model = None
+        
+        # COCO class IDs for detection
+        self.DETECTION_CLASSES = {
+            0: {"name": "person", "type": "person", "emoji": "👤", "min_conf": 0.20, "min_area": 0.005},
+            67: {"name": "cell phone", "type": "prohibited", "emoji": "📱", "min_conf": 0.40, "min_area": 0.003},
+            63: {"name": "laptop", "type": "prohibited", "emoji": "💻", "min_conf": 0.20, "min_area": 0.01},
+            62: {"name": "tv/monitor", "type": "prohibited", "emoji": "🖥️", "min_conf": 0.25, "min_area": 0.02},
+            73: {"name": "book", "type": "prohibited", "emoji": "📖", "min_conf": 0.25, "min_area": 0.01},
+            74: {"name": "clock/watch", "type": "prohibited", "emoji": "⌚", "min_conf": 0.20, "min_area": 0.001},
+            65: {"name": "remote", "type": "prohibited", "emoji": "📱", "min_conf": 0.15, "min_area": 0.0005},
+            # Additional classes that might be phones
+            77: {"name": "cell phone", "type": "prohibited", "emoji": "📱", "min_conf": 0.10, "min_area": 0.0005},  # Sometimes detected as this
+        }
+        
+    @property
+    def model(self):
+        """Lazy load YOLOv8 model - use MEDIUM for better small object detection"""
+        if self._model is None:
+            try:
+                from ultralytics import YOLO
+                # Use medium model for better accuracy on small objects
+                # Try 'm' first, fall back to 's' if not available
+                try:
+                    self._model = YOLO('yolov8m.pt')
+                    logger.info("✅ YOLOv8m (medium) detector loaded")
+                except:
+                    self._model = YOLO('yolov8s.pt')
+                    logger.info("✅ YOLOv8s (small) detector loaded")
+            except Exception as e:
+                logger.error(f"❌ Failed to load YOLOv8: {e}")
+                raise
+        return self._model
+    
+    def detect_persons_and_objects(self, image_data: bytes) -> Dict[str, Any]:
+        """
+        Run detection with multiple strategies to catch everything:
+        1. Normal detection
+        2. Enhanced contrast detection
+        3. Multi-scale detection
+        """
+        try:
+            import cv2
+            
+            # Decode image
+            nparr = np.frombuffer(image_data, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if img is None:
+                return {"error": "Failed to decode image", "person_count": 0}
+            
+            img_height, img_width = img.shape[:2]
+            img_area = img_height * img_width
+            
+            logger.info(f"🖼️ Processing image: {img_width}x{img_height}")
+            
+            # ==================== STRATEGY 1: Normal Detection ====================
+            all_detections = self._run_detection(img, img_area, "normal")
+            
+            # ==================== STRATEGY 2: Enhanced Image ====================
+            # Increase contrast and brightness to catch dark objects
+            enhanced = cv2.convertScaleAbs(img, alpha=1.3, beta=30)
+            enhanced_detections = self._run_detection(enhanced, img_area, "enhanced")
+            
+            # Merge detections (remove duplicates)
+            all_detections = self._merge_detections(all_detections, enhanced_detections)
+            
+            # ==================== STRATEGY 3: Edge Detection Focus ====================
+            # Convert to grayscale and enhance edges (helps with phones)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 50, 150)
+            edges_colored = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+            # Blend with original
+            blended = cv2.addWeighted(img, 0.7, edges_colored, 0.3, 0)
+            edge_detections = self._run_detection(blended, img_area, "edge_enhanced")
+            
+            all_detections = self._merge_detections(all_detections, edge_detections)
+            
+            # ==================== Separate persons and objects ====================
+            persons = []
+            prohibited_objects = []
+            
+            for det in all_detections:
+                if det["type"] == "person":
+                    persons.append(det)
+                elif det["type"] == "prohibited":
+                    prohibited_objects.append(det)
+            
+            # Sort by area
+            persons.sort(key=lambda p: p["area_ratio"], reverse=True)
+            prohibited_objects.sort(key=lambda o: o["confidence"], reverse=True)
+            
+            # Mark main user
+            if persons:
+                persons[0]["is_main_user"] = True
+            
+            # Build result
+            return self._build_result(persons, prohibited_objects, all_detections)
+            
+        except Exception as e:
+            logger.error(f"❌ Detection error: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "person_count": 0,
+                "persons": [],
+                "has_multiple_persons": False,
+                "has_unauthorized_presence": False,
+                "prohibited_objects": [],
+                "has_prohibited_objects": False,
+                "warning_message": None,
+                "violation_type": None,
+                "error": str(e)
+            }
+    
+    def _run_detection(self, img, img_area: int, strategy: str) -> List[Dict]:
+        """Run YOLO detection with very low confidence threshold"""
+        detections = []
+        
+        try:
+            # Run with VERY LOW confidence to catch everything
+            results = self.model(img, verbose=False, conf=0.05, iou=0.3)
+            
+            for result in results:
+                for box in result.boxes:
+                    class_id = int(box.cls[0])
+                    
+                    # Skip unknown classes
+                    if class_id not in self.DETECTION_CLASSES:
+                        continue
+                    
+                    class_config = self.DETECTION_CLASSES[class_id]
+                    confidence = float(box.conf[0])
+                    
+                    # Apply class-specific confidence threshold
+                    if confidence < class_config["min_conf"]:
+                        continue
+                    
+                    bbox = box.xyxy[0].cpu().numpy()
+                    x1, y1, x2, y2 = bbox
+                    
+                    box_area = (x2 - x1) * (y2 - y1)
+                    area_ratio = box_area / img_area
+                    
+                    # Apply class-specific area threshold
+                    if area_ratio < class_config["min_area"]:
+                        continue
+                    
+                    center_x = (x1 + x2) / 2
+                    center_y = (y1 + y2) / 2
+                    
+                    det = {
+                        "class_id": class_id,
+                        "class_name": class_config["name"],
+                        "type": class_config["type"],
+                        "emoji": class_config["emoji"],
+                        "confidence": round(confidence, 3),
+                        "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                        "center": [int(center_x), int(center_y)],
+                        "area_ratio": round(area_ratio, 5),
+                        "strategy": strategy
+                    }
+                    
+                    detections.append(det)
+                    
+                    if class_config["type"] == "prohibited":
+                        logger.warning(
+                            f"🚨 [{strategy}] {class_config['emoji']} {class_config['name']}: "
+                            f"conf={confidence:.0%}, area={area_ratio:.2%}"
+                        )
+                    
+        except Exception as e:
+            logger.error(f"Detection strategy '{strategy}' failed: {e}")
+        
+        return detections
+    
+    def _merge_detections(self, list1: List[Dict], list2: List[Dict]) -> List[Dict]:
+        """Merge two detection lists, removing duplicates based on IoU"""
+        merged = list(list1)
+        
+        for det2 in list2:
+            is_duplicate = False
+            
+            for det1 in merged:
+                if det1["class_id"] == det2["class_id"]:
+                    # Check IoU
+                    iou = self._calculate_iou(det1["bbox"], det2["bbox"])
+                    if iou > 0.3:  # 30% overlap = same object
+                        # Keep the one with higher confidence
+                        if det2["confidence"] > det1["confidence"]:
+                            det1.update(det2)
+                        is_duplicate = True
+                        break
+            
+            if not is_duplicate:
+                merged.append(det2)
+        
+        return merged
+    
+    def _calculate_iou(self, box1: List, box2: List) -> float:
+        """Calculate Intersection over Union"""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        
+        intersection = max(0, x2 - x1) * max(0, y2 - y1)
+        
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0
+    
+    def _build_result(self, persons: List, prohibited_objects: List, all_detections: List) -> Dict:
+        """Build final result"""
+        person_count = len(persons)
+        has_multiple = person_count > 1
+        has_prohibited = len(prohibited_objects) > 0
+        
+        warning_message = None
+        violation_type = None
+        unauthorized = False
+        
+        # Priority 1: Prohibited objects
+        if has_prohibited:
+            unauthorized = True
+            violation_type = "prohibited_object"
+            
+            obj = prohibited_objects[0]
+            if len(prohibited_objects) == 1:
+                warning_message = f"{obj['emoji']} {obj['class_name'].title()} detected in frame"
+            else:
+                names = [f"{o['emoji']} {o['class_name']}" for o in prohibited_objects[:3]]
+                warning_message = f"Prohibited items: {', '.join(names)}"
+        
+        # Priority 2: Multiple persons
+        elif has_multiple:
+            unauthorized = True
+            violation_type = "multiple_persons"
+            warning_message = f"👥 {person_count} people detected - only you should be visible"
+        
+        # Priority 3: No person
+        elif person_count == 0:
+            violation_type = "no_person"
+            warning_message = "👤 No person detected - please stay in frame"
+        
+        logger.info(
+            f"📊 Result: {person_count} person(s), {len(prohibited_objects)} prohibited, "
+            f"violation={violation_type}"
+        )
+        
+        return {
+            "person_count": person_count,
+            "persons": persons,
+            "has_multiple_persons": has_multiple,
+            "has_unauthorized_presence": unauthorized,
+            "prohibited_objects": prohibited_objects,
+            "has_prohibited_objects": has_prohibited,
+            "warning_message": warning_message,
+            "violation_type": violation_type,
+            "all_detections_count": len(all_detections),
+            "error": None
+        }
+    
+    # Alias
+    def detect_persons(self, image_data: bytes) -> Dict[str, Any]:
+        return self.detect_persons_and_objects(image_data)
+
+# Global person detector instance
+person_detector: Optional[PersonDetector] = None
+
+
+def get_person_detector() -> PersonDetector:
+    """Get or create the global person detector instance"""
+    global person_detector
+    if person_detector is None:
+        person_detector = PersonDetector()
+    return person_detector
 
 # Global service instances (initialized by init_biometric_services)
 biometric_service: Optional["BiometricAuthService"] = None
@@ -184,30 +473,15 @@ class BiometricAuthService:
     
     # ================== EMBEDDING EXTRACTION ==================
     
-    def extract_face_embedding(self, image_data: bytes) -> Tuple[Optional[np.ndarray], str ,str]:
+    def extract_face_embedding(self, image_data: bytes) -> Tuple[Optional[np.ndarray], str, str]:
         """
-        Extract face embedding from image bytes with enhanced security checks:
-        - No face detected
-        - Multiple faces detected
-        - Face too small / far from camera
-        - Face turned away (pose detection)
-        - Face obstructed (landmark detection)
-        - Poor detection confidence
+        Extract face embedding with FIXED attention detection.
         """
         try:
             import cv2
 
-            # Debug 1: Log received data size
-            logger.info(f"📊 Received image data: {len(image_data)} bytes")
-            
-            # Debug 2: Check if data is too small (likely blank/corrupted)
             if len(image_data) < 1000:
-                logger.error(f"❌ Image data too small: {len(image_data)} bytes - likely blank frame or corrupted data")
-                return None, "Camera capture failed - invalid image data (too small)", "extraction_error"
-            
-            # Debug 3: Check if data is suspiciously small (might be blank JPEG)
-            if len(image_data) < 5000:
-                logger.warning(f"⚠️ Image data is quite small: {len(image_data)} bytes - may be low quality or partially blank")
+                return None, "Camera capture failed - image too small", "extraction_error"
             
             nparr = np.frombuffer(image_data, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -215,25 +489,22 @@ class BiometricAuthService:
             if img is None:
                 return None, "Failed to decode image", "extraction_error"
 
-            logger.info(f"📐 Decoded image dimensions: {img.shape[1]}x{img.shape[0]} (WxH)")
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             img_height, img_width = img_rgb.shape[:2]
             
-            # Detect all faces in the image
             faces = self.face_analyzer.get(img_rgb)
             
-            # Check 1: No face detected
+            # ==================== NO FACE ====================
             if len(faces) == 0:
-                logger.warning("❌ No face detected in image")
-                return None, "No face detected in image - please ensure your face is clearly visible", "no_face"
+                return None, "👤 No face detected - please look at the camera", "no_face"
             
-            # Check 2: Multiple faces detected
+            # ==================== MULTIPLE FACES ====================
             if len(faces) > 1:
-                logger.warning(f"❌ Multiple faces detected: {len(faces)} faces found")
-                return None, f"Multiple faces detected ({len(faces)} faces) - only you should be visible", "multiple_faces"
+                return None, f"👥 Multiple faces ({len(faces)}) - only you should be visible", "multiple_faces"
+            
             face = faces[0]
             
-            # Check 3: Face bounding box and size
+            # ==================== FACE SIZE ====================
             bbox = face.bbox.astype(int)
             face_width = bbox[2] - bbox[0]
             face_height = bbox[3] - bbox[1]
@@ -241,109 +512,120 @@ class BiometricAuthService:
             image_area = img_width * img_height
             face_ratio = face_area / image_area
             
-            logger.info(f"📐 Face size: {face_width}x{face_height}, ratio: {face_ratio:.3f}")
+            if face_ratio < 0.02:
+                return None, "📏 Face too small - move closer to camera", "face_too_small"
             
-            # Face too small (less than 3% of image) - too far or partially visible
-            if face_ratio < 0.03:
-                logger.warning(f"❌ Face too small: ratio={face_ratio:.3f}")
-                return None, "Face too small or too far - please move closer to the camera", "face_too_small"
+            if face_ratio > 0.85:
+                return None, "📏 Face too close - move back slightly", "face_too_close"
             
-            # Face too large (more than 80% of image) - too close
-            if face_ratio > 0.80:
-                logger.warning(f"❌ Face too large: ratio={face_ratio:.3f}")
-                return None, "Face too close to camera - please move back slightly", "face_too_close"
+            # ==================== DETECTION CONFIDENCE ====================
+            det_score = float(face.det_score) if hasattr(face, 'det_score') else 1.0
+            if det_score < 0.4:
+                return None, "🔅 Face unclear - improve lighting", "poor_quality"
             
-            # Check 4: Detection confidence score
-            if hasattr(face, 'det_score'):
-                det_score = float(face.det_score)
-                logger.info(f"📊 Detection confidence: {det_score:.3f}")
+            # ==================== ATTENTION DETECTION (FIXED) ====================
+            pose = getattr(face, 'pose', None)
+            
+            if pose is not None and len(pose) >= 3:
+                # InsightFace returns pose as [pitch, yaw, roll] in DEGREES
+                # BUT the order and signs might vary by model version
                 
-                if det_score < 0.5:
-                    logger.warning(f"❌ Low detection confidence: {det_score:.3f}")
-                    return None, "Face not clearly visible - please ensure good lighting", "poor_quality"
+                # Log raw values for debugging
+                raw_pitch = float(pose[0])
+                raw_yaw = float(pose[1])
+                raw_roll = float(pose[2])
                 
-                if det_score < 0.7:
-                    logger.warning(f"⚠️ Medium detection confidence: {det_score:.3f}")
-                    # Continue but log warning - might be partial obstruction
-            
-            # Check 5: Face pose/orientation (yaw = left/right, pitch = up/down, roll = tilt)
-            if hasattr(face, 'pose') and face.pose is not None:
-                pose = face.pose
-                if len(pose) >= 3:
-                    pitch, yaw, roll = pose[0], pose[1], pose[2]
-                    logger.info(f"📐 Face pose: pitch={pitch:.1f}°, yaw={yaw:.1f}°, roll={roll:.1f}°")
-                    
-                    # Check if face is turned too much horizontally (looking left/right)
-                    if abs(yaw) > 35:
-                        direction = "left" if yaw > 0 else "right"
-                        logger.warning(f"❌ Face turned {direction}: yaw={yaw:.1f}°")
-                        return None, f"Face turned {direction} - please look at the camera", "face_turned"
-                    
-                    # Check if face is tilted too much vertically (looking up/down)
-                    if abs(pitch) > 35:
-                        direction = "down" if pitch > 0 else "up"
-                        logger.warning(f"❌ Face tilted {direction}: pitch={pitch:.1f}°")
-                        return None, f"Face tilted {direction} - please look straight at camera", "face_turned"
-                    
-                    # Check if face is rotated/tilted sideways
-                    if abs(roll) > 30:
-                        logger.warning(f"❌ Face tilted sideways: roll={roll:.1f}°")
-                        return None, "Head tilted sideways - please keep head straight", "face_turned"
-            
-            # Check 6: Facial landmarks for obstruction detection
-            if hasattr(face, 'landmark_2d_106') and face.landmark_2d_106 is not None:
-                landmarks = face.landmark_2d_106
+                logger.info(f"👀 Raw pose: pitch={raw_pitch:.1f}, yaw={raw_yaw:.1f}, roll={raw_roll:.1f}")
                 
-                # Check if key facial regions are properly detected
-                # 106-point landmark model: 
-                # - Eyes: points 33-42 (left eye), 87-96 (right eye)
-                # - Nose: points 52-71
-                # - Mouth: points 72-86
+                # Normalize - some models return different ranges
+                # Typically: yaw (left/right), pitch (up/down), roll (tilt)
                 
-                try:
-                    # Check eye regions
-                    left_eye_points = landmarks[33:43]
-                    right_eye_points = landmarks[87:97]
+                # Try to detect which value is which based on typical ranges
+                # Yaw usually has the largest range when looking left/right
+                
+                # Use absolute values for thresholds
+                abs_yaw = abs(raw_yaw)
+                abs_pitch = abs(raw_pitch)
+                abs_roll = abs(raw_roll)
+                
+                # ===== YAW: Looking LEFT/RIGHT =====
+                # Threshold: 20 degrees = definitely looking away
+                YAW_THRESHOLD = 20
+                if abs_yaw > YAW_THRESHOLD:
+                    direction = "left" if raw_yaw > 0 else "right"
+                    logger.warning(f"👀 LOOKING {direction.upper()}: yaw={raw_yaw:.1f}°")
+                    return None, f"👀 Looking {direction} - please face the camera", "not_looking_at_camera"
+                
+                # ===== PITCH: Looking UP/DOWN =====
+                # Threshold: 15 degrees for down (reading), 20 for up
+                PITCH_DOWN_THRESHOLD = 15
+                PITCH_UP_THRESHOLD = 20
+                
+                # Positive pitch usually means looking down
+                if raw_pitch > PITCH_DOWN_THRESHOLD:
+                    logger.warning(f"👀 LOOKING DOWN: pitch={raw_pitch:.1f}° - possible reading!")
+                    return None, "👀 Looking down detected - please look at camera", "looking_down"
+                
+                if raw_pitch < -PITCH_UP_THRESHOLD:
+                    logger.warning(f"👀 LOOKING UP: pitch={raw_pitch:.1f}°")
+                    return None, "👀 Looking up - please look straight at camera", "not_looking_at_camera"
+                
+                # ===== ROLL: Head TILT =====
+                ROLL_THRESHOLD = 25
+                if abs_roll > ROLL_THRESHOLD:
+                    logger.warning(f"🔄 HEAD TILTED: roll={raw_roll:.1f}°")
+                    return None, "🔄 Head tilted - please keep head straight", "head_tilted"
+                
+                logger.info(f"✅ Pose OK: pitch={raw_pitch:.1f}°, yaw={raw_yaw:.1f}°, roll={raw_roll:.1f}°")
+                
+            else:
+                # Pose not available - try alternative method using landmarks
+                logger.warning("⚠️ Pose data not available, checking landmarks...")
+                
+                if hasattr(face, 'landmark_2d_106') and face.landmark_2d_106 is not None:
+                    landmarks = face.landmark_2d_106
                     
-                    # Check if eye landmarks are within face bounding box
-                    left_eye_valid = np.all((left_eye_points[:, 0] >= bbox[0]) & 
-                                           (left_eye_points[:, 0] <= bbox[2]) &
-                                           (left_eye_points[:, 1] >= bbox[1]) & 
-                                           (left_eye_points[:, 1] <= bbox[3]))
-                    
-                    right_eye_valid = np.all((right_eye_points[:, 0] >= bbox[0]) & 
-                                            (right_eye_points[:, 0] <= bbox[2]) &
-                                            (right_eye_points[:, 1] >= bbox[1]) & 
-                                            (right_eye_points[:, 1] <= bbox[3]))
-                    
-                    if not left_eye_valid or not right_eye_valid:
-                        logger.warning("❌ Eye landmarks invalid - possible obstruction")
-                        return None, "Eyes not visible - remove objects covering your face", "face_obstructed"
-                    # Check nose region
-                    nose_points = landmarks[52:72]
-                    nose_center = np.mean(nose_points, axis=0)
-                    
-                    # Nose should be roughly in the center of the face
-                    face_center_x = (bbox[0] + bbox[2]) / 2
-                    nose_offset = abs(nose_center[0] - face_center_x) / face_width
-                    
-                    if nose_offset > 0.3:
-                        logger.warning(f"❌ Nose offset too high: {nose_offset:.2f}")
-                        return None, "Face partially obstructed - ensure full face is visible", "face_obstructed"
-                except Exception as landmark_error:
-                    logger.warning(f"⚠️ Landmark analysis error: {landmark_error}")
-                    # Continue without landmark checks if they fail
+                    try:
+                        # Use nose tip and face center to estimate pose
+                        # Nose tip is usually around index 54-55
+                        nose_tip = landmarks[54] if len(landmarks) > 54 else None
+                        
+                        # Face center from bbox
+                        face_center_x = (bbox[0] + bbox[2]) / 2
+                        face_center_y = (bbox[1] + bbox[3]) / 2
+                        
+                        if nose_tip is not None:
+                            # Calculate horizontal offset (yaw estimate)
+                            nose_offset_x = (nose_tip[0] - face_center_x) / face_width
+                            # Calculate vertical offset (pitch estimate)
+                            nose_offset_y = (nose_tip[1] - face_center_y) / face_height
+                            
+                            logger.info(f"👃 Nose offset: x={nose_offset_x:.2f}, y={nose_offset_y:.2f}")
+                            
+                            # If nose is significantly off-center, person is looking away
+                            if abs(nose_offset_x) > 0.15:
+                                direction = "left" if nose_offset_x < 0 else "right"
+                                logger.warning(f"👀 LOOKING {direction.upper()} (landmark-based)")
+                                return None, f"👀 Looking {direction} - please face the camera", "not_looking_at_camera"
+                            
+                            if nose_offset_y > 0.1:
+                                logger.warning(f"👀 LOOKING DOWN (landmark-based)")
+                                return None, "👀 Looking down - please look at camera", "looking_down"
+                                
+                    except Exception as landmark_err:
+                        logger.warning(f"Landmark analysis failed: {landmark_err}")
             
-            # Check 7: Verify embedding exists
+            # ==================== EXTRACT EMBEDDING ====================
             if face.embedding is None:
-                logger.warning("❌ Could not extract face embedding")
-                return None, "Could not extract face features - please try again", "extraction_error"
-            embedding = face.embedding
-            logger.info(f"✅ Face embedding extracted successfully: shape={embedding.shape}")
-            return embedding, "", ""
+                return None, "Could not extract face features", "extraction_error"
+            
+            logger.info(f"✅ Face embedding extracted successfully")
+            return face.embedding, "", ""
             
         except Exception as e:
-            logger.error(f"❌ Face embedding extraction error: {e}")
+            logger.error(f"❌ Face processing error: {e}")
+            import traceback
+            traceback.print_exc()
             return None, f"Face processing error: {str(e)}", "extraction_error"
 
     def extract_voice_embedding(self, audio_data: bytes, audio_format: str = "webm") -> Tuple[Optional[np.ndarray], str]:
@@ -464,7 +746,93 @@ class BiometricAuthService:
             "can_proceed": True,
             "error_type": None
         }
-    
+
+    def verify_face_with_person_detection(self, student_code: str, image_data: bytes) -> Dict[str, Any]:
+        """
+        Comprehensive verification that checks ALL security violations:
+        
+        Priority Order (to avoid false positives):
+        1. Face attention check FIRST (looking at camera, pose) - InsightFace
+        2. Face identity verification - InsightFace  
+        3. Multiple persons detection - YOLO
+        4. Prohibited objects (phones, laptops, etc.) - YOLO (only if face is OK)
+        
+        This order prevents YOLO false positives when user bends down.
+        """
+        
+        # ==================== STEP 1: FACE VERIFICATION FIRST ====================
+        # Check face attention and identity BEFORE running YOLO
+        # This catches "looking down", "no face", "looking away" etc.
+        face_result = self.verify_face(student_code, image_data)
+        
+        # If face verification failed due to attention/pose issues, return immediately
+        # Don't run YOLO - the user is not looking at camera, that's the real issue
+        face_error_type = face_result.get("error_type", "")
+        if face_error_type in ["no_face", "not_looking_at_camera", "looking_down", "head_tilted", 
+                            "face_too_small", "face_too_close", "poor_quality", "eyes_not_visible"]:
+            logger.warning(f"👀 ATTENTION VIOLATION: {face_result.get('error')} (type: {face_error_type})")
+            
+            face_result["violation_type"] = "attention_violation"
+            face_result["person_count"] = 1  # Assume person is there but not looking
+            face_result["prohibited_objects"] = []
+            face_result["detection_method"] = "face_attention"
+            return face_result
+        
+        # ==================== STEP 2: YOLO DETECTION (only if face is OK) ====================
+        detector = get_person_detector()
+        detection_result = detector.detect_persons_and_objects(image_data)
+        
+        if detection_result.get("error"):
+            logger.warning(f"Detection error: {detection_result['error']} - continuing with face result")
+        
+        # Check for multiple persons
+        elif detection_result["has_multiple_persons"]:
+            logger.warning(f"👥 MULTIPLE PERSONS: {detection_result['warning_message']}")
+            
+            return {
+                "verified": False,
+                "similarity": 0.0,
+                "threshold": self.FACE_SIMILARITY_THRESHOLD,
+                "error": detection_result["warning_message"],
+                "can_proceed": False,
+                "error_type": "multiple_persons",
+                "violation_type": "multiple_persons",
+                "person_count": detection_result["person_count"],
+                "detection_method": "yolo_person"
+            }
+        
+        # Check for prohibited objects
+        elif detection_result["has_prohibited_objects"]:
+            objects = detection_result.get("prohibited_objects", [])
+            
+            logger.warning(f"🚨 PROHIBITED OBJECT: {detection_result['warning_message']}")
+            
+            return {
+                "verified": False,
+                "similarity": 0.0,
+                "threshold": self.FACE_SIMILARITY_THRESHOLD,
+                "error": detection_result["warning_message"],
+                "can_proceed": False,
+                "error_type": "prohibited_object",
+                "violation_type": "prohibited_object",
+                "prohibited_objects": [o["class_name"] for o in objects],
+                "person_count": detection_result["person_count"],
+                "detection_method": "yolo_object",
+                "detection_details": objects[:3]
+            }
+        
+        # ==================== STEP 3: RETURN FACE RESULT ====================
+        # Add detection info
+        face_result["person_count"] = detection_result.get("person_count", 1)
+        face_result["prohibited_objects"] = []
+        face_result["detection_method"] = "face_and_object"
+        
+        # Map specific error types for frontend
+        if face_error_type == "face_mismatch":
+            face_result["violation_type"] = "identity_mismatch"
+        
+        return face_result
+
     def verify_voice(self, student_code: str, audio_data: bytes, audio_format: str = "webm") -> Dict[str, Any]:
         """Verify voice against stored embedding"""
         stored_embedding = self.get_stored_voice_embedding(student_code)

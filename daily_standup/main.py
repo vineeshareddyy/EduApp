@@ -4365,6 +4365,67 @@ async def verify_face_endpoint(request: FaceVerificationRequest):
         logger.error(f"❌ Face verification error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/auth/verify-face-strict")
+async def verify_face_strict_endpoint(request: FaceVerificationRequest):
+    """
+    Strict face verification that also detects any human presence using YOLO.
+    - Detects multiple persons even without visible faces
+    - Detects hands, shoulders, people in background
+    - More secure than face-only verification
+    
+    Use this for continuous verification during standup sessions.
+    """
+    from core.biometric_auth import get_biometric_service
+    
+    service = get_biometric_service()
+    if service is None:
+        raise HTTPException(
+            status_code=503, 
+            detail="Biometric authentication service not available"
+        )
+    
+    try:
+        # Decode base64 image
+        image_base64 = request.image_base64
+        
+        # Handle data URL format (data:image/jpeg;base64,...)
+        if "," in image_base64:
+            image_base64 = image_base64.split(",")[1]
+        
+        try:
+            image_data = base64.b64decode(image_base64)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}")
+        
+        # Use enhanced verification with person detection
+        result = service.verify_face_with_person_detection(
+            student_code=request.student_code,
+            image_data=image_data
+        )
+        
+        logger.info(
+            f"🔐 Strict face verification for {request.student_code}: "
+            f"verified={result['verified']}, person_count={result.get('person_count', 'N/A')}, "
+            f"error_type={result.get('error_type')}, method={result.get('detection_method')}"
+        )
+        
+        return {
+            "verified": result["verified"],
+            "similarity": result["similarity"],
+            "threshold": result["threshold"],
+            "error": result.get("error"),
+            "error_type": result.get("error_type"),
+            "can_proceed": result["verified"],
+            "person_count": result.get("person_count", 1),
+            "detection_method": result.get("detection_method", "face_only")
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Strict face verification error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 '''@app.post("/auth/verify-voice/{session_id}")
 async def verify_voice_endpoint(
@@ -4448,6 +4509,29 @@ async def verify_voice_endpoint(
     except Exception as e:
         logger.error(f"❌ Voice verification error: {e}")
         raise HTTPException(status_code=500, detail=str(e))'''
+
+def interpret_angle(angle: float, angle_type: str) -> str:
+    """Interpret what the angle means"""
+    if angle_type == "yaw":
+        if angle > 15:
+            return f"Looking LEFT ({angle:.1f}°)"
+        elif angle < -15:
+            return f"Looking RIGHT ({angle:.1f}°)"
+        else:
+            return f"Facing camera ({angle:.1f}°)"
+    elif angle_type == "pitch":
+        if angle > 15:
+            return f"Looking DOWN ({angle:.1f}°)"
+        elif angle < -15:
+            return f"Looking UP ({angle:.1f}°)"
+        else:
+            return f"Level ({angle:.1f}°)"
+    elif angle_type == "roll":
+        if abs(angle) > 15:
+            return f"Head tilted ({angle:.1f}°)"
+        else:
+            return f"Head straight ({angle:.1f}°)"
+    return f"{angle:.1f}°"
 
 @app.post("/auth/verify-voice/{session_id}")
 async def verify_voice_endpoint(
