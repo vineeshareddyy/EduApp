@@ -18,14 +18,16 @@ import json
 import random
 import hashlib
 import tempfile
+import subprocess
 import io
+import wave
 from typing import List, AsyncGenerator, Tuple, Optional, Dict, Any
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
-
+import numpy as np
 # ---- External clients (both sync & async variants) ----
 import openai as openai_sync
 from groq import Groq, AsyncGroq
@@ -1011,7 +1013,7 @@ FEEDBACK: [One sentence explaining why]"""
 # ---- Round durations: Communication 10 min, Technical 25 min, HR 10 min ----
 ROUND_DURATIONS = {
     "introduction": 60,       # 1 minute
-    "communication": 600,     # 10 minutes
+    "communication": 300,     # 10 minutes
     "technical": 1500,        # 25 minutes
     "hr": 600,                # 10 minutes
 }
@@ -1203,6 +1205,7 @@ class WI_ConversationState:
     current_topic: str = ""
     last_question: str = ""
     last_user_response: str = ""
+    last_pure_question: str = ""
     followups_on_topic: int = 0
     max_followups: int = 2
     topics_discussed: List[str] = field(default_factory=list)
@@ -1319,6 +1322,17 @@ class WI_InterviewSession:
         self.exchanges.append(ex)
         self.questions_per_round[self.current_stage.value] = self.questions_per_round.get(self.current_stage.value, 0) + 1
         self.questions_asked.append(ai_message)
+        if '?' in ai_message:
+            parts = ai_message.split('?')
+            for i in range(len(parts) - 1, -1, -1):
+                part = parts[i].strip()
+                if len(part) > 10:
+                    for sep in ['. ', '! ', '\n']:
+                        if sep in part: part = part.split(sep)[-1].strip()
+                    self.conversation_state.last_pure_question = part + '?'
+                    break
+        else:
+            self.conversation_state.last_pure_question = ai_message
 
     def update_last_response(self, user_response: str, quality: float,
                              answer_quality: str = "neutral", technical_accuracy: float = None):
@@ -1347,6 +1361,25 @@ class WI_InterviewSession:
             if ex.user_response:
                 return ex.user_response
         return ""
+    
+    def get_conversation_by_round(self):
+        result = {"communication": [], "technical": [], "hr": []}
+        for ex in self.exchanges:
+            exchange_data = {
+                "question": ex.ai_message,
+                "answer": ex.user_response or "[NO RESPONSE]",
+                "timestamp": ex.timestamp,
+                "answer_quality": ex.answer_quality,
+                "is_followup": ex.is_followup,
+                "technical_accuracy": ex.technical_accuracy
+            }
+            if ex.stage == WI_InterviewStage.COMMUNICATION:
+                result["communication"].append(exchange_data)
+            elif ex.stage == WI_InterviewStage.TECHNICAL:
+                result["technical"].append(exchange_data)
+            elif ex.stage == WI_InterviewStage.HR:
+                result["hr"].append(exchange_data)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -1487,6 +1520,186 @@ class WI_EnhancedInterviewFragmentManager:
     def add_question(self, question, concept, is_followup=False):
         pass
 
+# =============================================================================
+# HUMAN VOICE DETECTION + AUDIO PREPROCESSING + DEVICE HEALTH MONITOR
+# (Headphone/Bluetooth support)
+# =============================================================================
+
+class HumanVoiceDetector:
+    """Detects human voice and rejects non-human sounds (TV, fan, traffic, music)."""
+    VOICE_FREQ_LOW = 60
+    VOICE_FREQ_HIGH = 4000
+    VOICE_ENERGY_THRESHOLD = 0.005
+    VOICE_RATIO_THRESHOLD = 0.20
+    ZCR_LOW = 0.01
+    ZCR_HIGH = 0.45
+    MIN_CONFIDENCE = 0.20
+
+    def __init__(self, sample_rate=16000):
+        self.sample_rate = sample_rate
+
+    def audio_bytes_to_numpy(self, audio_data):
+        try:
+            try:
+                with io.BytesIO(audio_data) as audio_io:
+                    with wave.open(audio_io, 'rb') as wav:
+                        self.sample_rate = wav.getframerate()
+                        n_channels = wav.getnchannels()
+                        sampwidth = wav.getsampwidth()
+                        frames = wav.readframes(wav.getnframes())
+                        if sampwidth == 2: samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+                        elif sampwidth == 4: samples = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+                        else: samples = np.frombuffer(frames, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
+                        if n_channels > 1: samples = samples.reshape(-1, n_channels).mean(axis=1)
+                        return samples
+            except Exception:
+                pass
+            try:
+                target_sr = 16000
+                result = subprocess.run(
+                    ['ffmpeg', '-i', 'pipe:0', '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', str(target_sr), '-ac', '1', 'pipe:1'],
+                    input=audio_data, capture_output=True, timeout=10
+                )
+                if result.returncode == 0 and len(result.stdout) > 0:
+                    samples = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+                    self.sample_rate = target_sr
+                    return samples
+            except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+                pass
+            return None
+        except Exception as e:
+            logger.error(f"[VAD] Audio conversion failed: {e}")
+            return None
+
+    def _spectral_voice_ratio(self, samples):
+        try:
+            window = np.hanning(len(samples))
+            fft_result = np.abs(np.fft.rfft(samples * window))
+            freqs = np.fft.rfftfreq(len(samples), 1.0 / self.sample_rate)
+            total_energy = np.sum(fft_result ** 2)
+            if total_energy < 1e-10: return 0.0
+            voice_mask = (freqs >= self.VOICE_FREQ_LOW) & (freqs <= self.VOICE_FREQ_HIGH)
+            return np.sum(fft_result[voice_mask] ** 2) / total_energy
+        except Exception: return 0.0
+
+    def _zero_crossing_rate(self, samples):
+        try:
+            if len(samples) < 2: return 0.0
+            signs = np.sign(samples)
+            return np.sum(np.abs(np.diff(signs)) > 0) / len(samples)
+        except Exception: return 0.0
+
+    def _speech_pattern_score(self, samples, frame_size=1024):
+        try:
+            n_frames = len(samples) // frame_size
+            if n_frames < 3: return 0.5
+            frame_energies = np.array([np.sqrt(np.mean(samples[i*frame_size:(i+1)*frame_size]**2)) for i in range(n_frames)])
+            max_energy = np.max(frame_energies)
+            if max_energy < 1e-6: return 0.0
+            frame_energies /= max_energy
+            energy_std = np.std(frame_energies)
+            energy_mean = np.mean(frame_energies)
+            voiced = frame_energies > (energy_mean * 0.5)
+            transition_rate = np.sum(np.abs(np.diff(voiced.astype(int)))) / n_frames
+            score = 0.0
+            if 0.1 <= transition_rate <= 0.5: score += 0.5
+            elif transition_rate < 0.1: score += 0.1
+            else: score += 0.2
+            if 0.15 <= energy_std <= 0.45: score += 0.5
+            elif energy_std < 0.15: score += 0.1
+            else: score += 0.2
+            return score
+        except Exception: return 0.5
+
+    def is_human_voice(self, audio_data):
+        samples = self.audio_bytes_to_numpy(audio_data)
+        if samples is None or len(samples) < 1000: return False, 0.0, {"error": "too_short"}
+        rms = float(np.sqrt(np.mean(samples ** 2)))
+        if rms < self.VOICE_ENERGY_THRESHOLD: return False, 0.0, {"rms": rms, "reason": "silence"}
+        voice_ratio = self._spectral_voice_ratio(samples)
+        zcr = self._zero_crossing_rate(samples)
+        pattern = self._speech_pattern_score(samples)
+        vr_score = min(voice_ratio / 0.6, 1.0) * 0.35 if voice_ratio >= self.VOICE_RATIO_THRESHOLD else (voice_ratio * 0.2)
+        zcr_score = 0.0
+        if self.ZCR_LOW <= zcr <= self.ZCR_HIGH:
+            center = (self.ZCR_LOW + self.ZCR_HIGH) / 2
+            deviation = abs(zcr - center) / (self.ZCR_HIGH - self.ZCR_LOW)
+            zcr_score = (1.0 - deviation) * 0.25
+        elif zcr < self.ZCR_LOW * 3:
+            zcr_score = 0.08
+        pat_score = pattern * 0.40
+        confidence = vr_score + zcr_score + pat_score
+        is_voice = confidence >= self.MIN_CONFIDENCE
+        logger.info(f"[VAD] is_voice={is_voice} conf={confidence:.2f} [ratio={voice_ratio:.2f} zcr={zcr:.3f} pattern={pattern:.2f} rms={rms:.4f}]")
+        return is_voice, confidence, {"rms": round(rms, 4), "voice_ratio": round(voice_ratio, 3), "confidence": round(confidence, 3), "is_voice": is_voice}
+
+
+class AudioPreprocessor:
+    """Gently cleans audio before Whisper: trim silence + normalize. No spectral manipulation."""
+    def __init__(self, sample_rate=16000):
+        self.sample_rate = sample_rate
+        self._vad = HumanVoiceDetector(sample_rate)
+
+    def _normalize(self, samples):
+        max_val = np.max(np.abs(samples))
+        return samples * (0.8 / max_val) if max_val > 1e-6 else samples
+
+    def _trim_silence(self, samples, threshold=0.003, pad=3200):
+        above = np.where(np.abs(samples) > threshold)[0]
+        if len(above) == 0: return samples
+        start = max(0, above[0] - pad)
+        end = min(len(samples), above[-1] + pad)
+        if (end - start) < len(samples) * 0.5: return samples
+        return samples[start:end]
+
+    def _to_wav_bytes(self, samples):
+        pcm = (samples * 32767).astype(np.int16)
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as wav:
+            wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(self.sample_rate)
+            wav.writeframes(pcm.tobytes())
+        return buf.getvalue()
+
+    def preprocess(self, audio_data):
+        try:
+            samples = self._vad.audio_bytes_to_numpy(audio_data)
+            if samples is None: return audio_data
+            orig_len = len(samples)
+            samples = self._trim_silence(samples)
+            samples = self._normalize(samples)
+            logger.info(f"[AUDIO] Preprocessed: {orig_len} -> {len(samples)} samples")
+            return self._to_wav_bytes(samples)
+        except Exception as e:
+            logger.error(f"[AUDIO] Preprocessing failed: {e}"); return audio_data
+
+
+class AudioDeviceHealthMonitor:
+    """Detects Bluetooth/headphone disconnect. Keeps interview alive."""
+    GRACE_PERIOD = 10
+    MAX_BAD_BEFORE_WARN = 3
+    def __init__(self): self.last_good_time = None; self.consecutive_bad = 0; self.disconnect_detected = False
+    def check_audio_health(self, audio_data):
+        try:
+            if not audio_data or len(audio_data) < 50: self.consecutive_bad += 1; return self._decide("empty_audio")
+            vad = HumanVoiceDetector(); samples = vad.audio_bytes_to_numpy(audio_data)
+            if samples is None: self.consecutive_bad += 1; return self._decide("unreadable")
+            rms = float(np.sqrt(np.mean(samples ** 2)))
+            if rms < 0.0005: self.consecutive_bad += 1; return self._decide("dead_silence")
+            if rms > 0.9: self.consecutive_bad += 1; return self._decide("static")
+            self.consecutive_bad = 0; self.disconnect_detected = False; self.last_good_time = time.time()
+            return {"healthy": True, "action": "continue"}
+        except Exception as e:
+            logger.error(f"[DEVICE] Health check error: {e}"); return {"healthy": True, "action": "continue"}
+    def _decide(self, issue):
+        if self.consecutive_bad >= self.MAX_BAD_BEFORE_WARN:
+            self.disconnect_detected = True
+            if self.last_good_time:
+                elapsed = time.time() - self.last_good_time
+                if elapsed < self.GRACE_PERIOD:
+                    return {"healthy": False, "action": "wait_reconnect", "issue": issue, "message": f"Audio device may have disconnected. Waiting {int(self.GRACE_PERIOD - elapsed)}s..."}
+            return {"healthy": False, "action": "warn_user", "issue": issue, "message": "Audio device disconnected. Please check your headphones/microphone."}
+        return {"healthy": True, "action": "continue", "issue": issue}
+    def reset(self): self.last_good_time = time.time(); self.consecutive_bad = 0; self.disconnect_detected = False
 
 # ---------------------------------------------------------------------------
 # WI Audio Processor (with hallucination detection)
@@ -1495,7 +1708,18 @@ class WI_EnhancedInterviewFragmentManager:
 class WI_OptimizedAudioProcessor:
     def __init__(self, client_manager):
         self.client_manager = client_manager
+        self.voice_detector = HumanVoiceDetector()
+        self.audio_preprocessor = AudioPreprocessor()
+        self.device_monitor = AudioDeviceHealthMonitor()
         self.HALLUCINATION_PHRASES = [
+            # Whisper prompt echoes
+            "the speaker is answering questions about their",
+            "interview response",
+            "the speaker is answering",
+            "answering questions about their work",
+            "work experience, technical skills",
+            "technical skills, and projects",
+            # Standard Whisper hallucinations
             "thank you for watching", "thanks for watching", "please subscribe",
             "like and subscribe", "see you in the next", "bye bye", "goodbye",
             "thank you for listening", "the end", "music", "applause", "laughter",
@@ -1504,45 +1728,64 @@ class WI_OptimizedAudioProcessor:
             "leave a comment", "check out my", "link in description", "sponsored by",
         ]
 
+    def _decode_to_wav(self, audio_data: bytes) -> bytes:
+        """Decode any audio format to WAV PCM. Runs ffmpeg once."""
+        if audio_data[:4] == b'RIFF' and audio_data[8:12] == b'WAVE':
+            return audio_data
+        try:
+            result = subprocess.run(
+                ['ffmpeg', '-i', 'pipe:0', '-f', 'wav', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', 'pipe:1'],
+                input=audio_data, capture_output=True, timeout=10
+            )
+            if result.returncode == 0 and len(result.stdout) > 100:
+                return result.stdout
+            return None
+        except: return None
+
     async def transcribe_audio_fast(self, audio_data: bytes) -> Tuple[str, float]:
         await self.client_manager.initialize()
-        if len(audio_data) < 2000:
-            logger.warning(f"[WI] Audio too small: {len(audio_data)} bytes - likely no speech")
-            return "", 0.0
+        if len(audio_data) < 2000: return "", 0.0
 
+        decoded_wav = self._decode_to_wav(audio_data)
+        if decoded_wav is None: return "", 0.0
+
+        # Device Health Check
+        device_health = self.device_monitor.check_audio_health(decoded_wav)
+        if not device_health["healthy"]:
+            if device_health["action"] == "warn_user": return "__DEVICE_DISCONNECTED__", 0.0
+            elif device_health["action"] == "wait_reconnect": return "__DEVICE_RECONNECTING__", 0.0
+
+        # Human Voice Detection
+        is_voice, vad_confidence, _ = self.voice_detector.is_human_voice(decoded_wav)
+        if not is_voice: return "", 0.0
+
+        # Preprocess Audio
+        processed_audio = self.audio_preprocessor.preprocess(decoded_wav)
+
+        # Transcribe
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-            tf.write(audio_data)
-            temp_path = tf.name
+            tf.write(processed_audio); temp_path = tf.name
         try:
-            with open(temp_path, "rb") as f:
-                audio_bytes = f.read()
+            with open(temp_path, "rb") as f: audio_bytes = f.read()
             tr = await self.client_manager.groq_client.audio.transcriptions.create(
                 file=(temp_path, audio_bytes), model="whisper-large-v3-turbo", language="en",
-                prompt="Interview response. The speaker is answering questions about their work experience, technical skills, and projects."
+                prompt="um, uh, like, okay, so, yeah, right, actually, basically"
             )
             raw_text = tr.text.strip() if hasattr(tr, 'text') else ""
-            logger.info(f"[WI] Raw transcript: {raw_text[:150]}...")
-            if not raw_text:
-                return "", 0.0
+            if not raw_text: return "", 0.0
             cleaned_text = self._remove_hallucinations(raw_text)
-            confidence = self._calculate_confidence(cleaned_text)
-            if confidence < 0.3:
-                logger.warning(f"[WI] Low confidence ({confidence:.2f}), treating as no response: {raw_text[:80]}")
-                return "", confidence
+            confidence = (self._calculate_confidence(cleaned_text) + vad_confidence) / 2
+            if confidence < 0.3: return "", confidence
             final_text = self._final_cleanup(cleaned_text)
-            if len(final_text.split()) < 2:
-                logger.warning(f"[WI] Too short after cleanup: '{final_text}'")
-                return "", 0.2
-            logger.info(f"[WI] Final transcript (conf={confidence:.2f}): {final_text[:100]}")
+            if len(final_text.split()) < 2: return "", 0.2
+            self.device_monitor.consecutive_bad = 0
+            self.device_monitor.disconnect_detected = False
             return final_text, confidence
         except Exception as e:
-            logger.error(f"[WI] Transcription error: {e}")
-            return "", 0.0
+            logger.error(f"[WI] Transcription error: {e}"); return "", 0.0
         finally:
-            try:
-                os.unlink(temp_path)
-            except:
-                pass
+            try: os.unlink(temp_path)
+            except: pass
 
     def _remove_hallucinations(self, text: str) -> str:
         if not text:
@@ -1723,6 +1966,25 @@ Reply with ONLY a number between 0.0 and 1.0"""
         if session.conversation_state.followups_on_topic >= 2:
             return False
         return random.random() < (0.6 if quality == "strong" else 0.4)
+
+    def _extract_question_from_response(self, ai_message):
+        if not ai_message:
+            return "Could you please repeat your answer?"
+        cleaned = ai_message.strip()
+        prefixes_to_remove = ["Of course! The question was:", "Sure, let me repeat:", "No problem! Here it is again:", "Let me repeat that:", "Here's the question again:"]
+        for prefix in prefixes_to_remove:
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix):].strip()
+        if '?' in cleaned:
+            parts = cleaned.split('?')
+            for i in range(len(parts) - 1, -1, -1):
+                part = parts[i].strip()
+                if len(part) > 10:
+                    for sep in ['. ', '! ', '\n']:
+                        if sep in part:
+                            part = part.split(sep)[-1].strip()
+                    return part + '?'
+        return cleaned
 
     def _adjust_difficulty(self, session, quality):
         if session.current_stage != WI_InterviewStage.TECHNICAL:
@@ -2197,15 +2459,8 @@ Generate a short follow-up question. MAX 12 words."""
     async def generate_first_question(self, session) -> str:
         return await self.generate_introduction(session)
 
-    async def generate_introduction(self, session) -> str:
-        return f"""Hello {session.student_name}! Welcome to your weekly interview session. I'm excited to chat with you today!
-
-We'll have three rounds:
-• First, a Communication round (about 10 minutes) where we'll have a casual conversation and get to know each other.
-• Then, a Technical round (about 25 minutes) where we'll discuss your recent work and technical knowledge.
-• Finally, an HR round (about 10 minutes) with some behavioral questions.
-
-So, how are you doing today? Ready to get started?"""
+    async def generate_introduction(self, session):
+        return f"""Hello {session.student_name}! Welcome to your weekly interview session. I'm excited to chat with you today!\n\nWe'll have three rounds:\n• First, a Communication round (about 5 minutes) where we'll have a casual conversation and get to know each other.\n• Then, a Technical round (about 25 minutes) where we'll discuss your recent work and technical knowledge.\n• Finally, an HR round (about 10 minutes) with some behavioral questions.\n\nSo, how are you doing today? Ready to get started?"""
 
     async def generate_silence_response(self, session) -> str:
         session.silence_prompt_count += 1
@@ -2224,7 +2479,12 @@ So, how are you doing today? Ready to get started?"""
         # Handle REPEAT
         if quality == "repeat":
             if session.exchanges:
-                repeat_response = f"{random.choice(REPEAT_RESPONSES)} {session.exchanges[-1].ai_message}"
+                if session.conversation_state.last_pure_question:
+                    original_question = session.conversation_state.last_pure_question
+                else:
+                    last_ai_msg = session.exchanges[-1].ai_message
+                    original_question = self._extract_question_from_response(last_ai_msg)
+                repeat_response = f"{random.choice(REPEAT_RESPONSES)} {original_question}"
                 session.last_was_repeat = True
                 return repeat_response
             return "Let me start with a question!"
