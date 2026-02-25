@@ -126,6 +126,15 @@ class Config:
     FILLER_IGNORE_MAX_TOKENS = int(os.getenv("FILLER_IGNORE_MAX_TOKENS", "2"))
 
     # =========================================================================
+    # AWS S3 CONFIG (for PDF storage)
+    # =========================================================================
+    AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
+    AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
+    AWS_S3_BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME", "imeetpro-225220763325")
+    AWS_S3_INTERVIEW_PREFIX = os.getenv("AWS_S3_INTERVIEW_PREFIX", "weekly-interviews")
+
+    # =========================================================================
     # GREETING / LLM SETTINGS (Daily Standup)
     # =========================================================================
     GREETING_LLM_ENABLED = os.getenv("GREETING_LLM_ENABLED", "true").lower() == "true"
@@ -281,7 +290,7 @@ class Config:
     # =========================================================================
     # PERFORMANCE
     # =========================================================================
-    THREAD_POOL_MAX_WORKERS = int(os.getenv("THREAD_POOL_MAX_WORKERS", "4"))
+    THREAD_POOL_MAX_WORKERS = int(os.getenv("THREAD_POOL_MAX_WORKERS", "20"))
     MONGO_MAX_POOL_SIZE = int(os.getenv("MONGO_MAX_POOL_SIZE", "50"))
     MONGO_SERVER_SELECTION_TIMEOUT = int(
         os.getenv("MONGO_SERVER_SELECTION_TIMEOUT", "5000")

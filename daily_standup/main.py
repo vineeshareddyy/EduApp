@@ -9,6 +9,9 @@ import time
 import uuid
 import logging
 import io
+import os
+import boto3
+from botocore.exceptions import ClientError
 from pydantic import BaseModel
 from typing import Dict, Optional, Any, List
 from pathlib import Path
@@ -105,26 +108,18 @@ class VoiceVerificationResponse(BaseModel):
 # =============================================================================
 def save_qa_to_mongodb(session_id: str, student_id: int, student_name: str,
                        conversation_log: list, test_id: str = None) -> bool:
+
     """Save Q&A exchanges to MongoDB as a SINGLE document (ml_notes.daily_standup_results)."""
     try:
-        from pymongo import MongoClient
-        from urllib.parse import quote_plus
         from datetime import datetime
+        from core.mongo_pool import get_db  # ✅ Use shared pool
         
-        encoded_pass = quote_plus("LT@connect25")
-        connection_string = (
-            f"mongodb://connectly:{encoded_pass}"
-            f"@192.168.48.201:27017/ml_notes"
-            f"?authSource=admin"
-        )
-        
-        client = MongoClient(connection_string, serverSelectionTimeoutMS=10000)
-        db = client["ml_notes"]
+        db = get_db()
         collection = db["daily_standup_results"]
         
         if not conversation_log:
             logger.warning("No conversation log to save")
-            client.close()
+            
             return True
         
         logger.info(f"📝 Processing {len(conversation_log)} exchanges for session {session_id}")
@@ -187,6 +182,9 @@ def save_qa_to_mongodb(session_id: str, student_id: int, student_name: str,
             elif user_answer == "[IRRELEVANT]":
                 response_type = "irrelevant"
                 irrelevant += 1
+            elif user_answer == "[SILENCE_PROMPT_ACKNOWLEDGED]":
+                response_type = "silence_acknowledgment"
+                # Don't count toward any score — it's just presence confirmation
             else:
                 lower = user_answer.lower()
                 if any(p in lower for p in ["repeat", "again", "what did you", "didn't hear", "pardon", "can you repeat", "say that again"]):
@@ -253,7 +251,6 @@ def save_qa_to_mongodb(session_id: str, student_id: int, student_name: str,
         else:
             logger.error("❌ Failed to save session document")
         
-        client.close()
         return True
             
     except Exception as e:
@@ -275,21 +272,10 @@ def save_feedback_to_mongodb(payload: dict) -> bool:
     documents, allowing all session data to be queried together.
     """
     try:
-        from pymongo import MongoClient
-        from urllib.parse import quote_plus
         from datetime import datetime
+        from core.mongo_pool import get_db  # ✅ Use shared pool
         
-        encoded_pass = quote_plus("LT@connect25")
-        connection_string = (
-            f"mongodb://connectly:{encoded_pass}"
-            f"@192.168.48.201:27017/ml_notes"
-            f"?authSource=admin"
-        )
-        
-        client = MongoClient(connection_string, serverSelectionTimeoutMS=10000)
-        db = client["ml_notes"]
-        
-        # ✅ CHANGED: Use daily_standup_results instead of daily_standup_feedback
+        db = get_db()
         collection = db["daily_standup_results"]
         
         # Build feedback document
@@ -339,11 +325,11 @@ def save_feedback_to_mongodb(payload: dict) -> bool:
             logger.info(f"   └─ Document type: session_feedback")
             logger.info(f"   └─ Average rating: {feedback_document['average_rating']:.1f}/5")
             logger.info(f"   └─ Technical issues: {len(feedback_document['technical_issues'])} reported")
-            client.close()
+            
             return True
         else:
             logger.error("❌ Failed to save feedback document")
-            client.close()
+        
             return False
         
     except Exception as e:
@@ -359,6 +345,9 @@ def save_feedback_to_mongodb(payload: dict) -> bool:
 class UltraFastSessionManagerWithSilenceHandling:
     def __init__(self):
         self.active_sessions: Dict[str, SessionData] = {}
+        # ✅ FIX: Per-student locks prevent duplicate session creation
+        self._session_creation_locks: Dict[int, asyncio.Lock] = {}
+        self._global_lock = asyncio.Lock()
         self.db_manager = DatabaseManager(shared_clients)
         self.audio_processor = OptimizedAudioProcessor(shared_clients)
         self.tts_processor = UltraFastTTSProcessor(
@@ -366,6 +355,13 @@ class UltraFastSessionManagerWithSilenceHandling:
             encode=getattr(config, "TTS_STREAM_ENCODING", "wav"),
         )
         self.conversation_manager = OptimizedConversationManager(shared_clients)
+
+    async def _get_student_lock(self, student_id: int) -> asyncio.Lock:
+        """Get or create a per-student lock for session creation."""
+        async with self._global_lock:
+            if student_id not in self._session_creation_locks:
+                self._session_creation_locks[student_id] = asyncio.Lock()
+            return self._session_creation_locks[student_id]
 
     # --- small helper: domain inference to steer prompts ---
     def _infer_domain(self, text: str) -> str:
@@ -378,6 +374,159 @@ class UltraFastSessionManagerWithSilenceHandling:
             return "general"
         except Exception:
             return "general"
+
+    async def _classify_silence_response(self, transcript: str, session_data) -> str:
+        """
+        Classify response after silence prompt:
+        - "acknowledgment": Just confirming presence
+        - "technical": Actually answering the question  
+        - "both": Ack + technical combined
+        """
+        if not transcript:
+            return "acknowledgment"
+        
+        transcript_lower = transcript.lower().strip()
+        transcript_words = transcript_lower.split()
+        word_count = len(transcript_words)
+        
+        # --- FAST: Pure acknowledgment phrases ---
+        pure_ack_phrases = [
+            "yes", "yeah", "yep", "yup", "yes i am", "i am here", "i'm here",
+            "im here", "present", "i am present", "yes i am present",
+            "i'm still here", "im still here", "yes i can hear you",
+            "i can hear you", "hello", "hi", "hey", "i'm listening",
+            "yes i'm here", "yes im here", "i am", "still here",
+            "yes i can", "yeah i'm here", "yeah im here",
+            "yes sir", "yes ma'am", "ok", "okay",
+        ]
+        
+        for phrase in pure_ack_phrases:
+            if transcript_lower.rstrip('.!?,') == phrase:
+                return "acknowledgment"
+        
+        # --- Short (≤5 words) without technical terms → acknowledgment ---
+        if word_count <= 5:
+            technical_indicators = [
+                'client', 'sap', 'system', 'data', 'server', 'code', 'transaction',
+                'table', 'field', 'module', 'function', 'process', 'database',
+                'query', 'api', 'config', 'install', 'deploy', 'error', 'debug',
+                'class', 'method', 'object', 'variable', 'algorithm', 'network',
+                'port', 'protocol', 'kernel', 'patch', 'update', 'backup',
+                'types', 'three', 'four', 'first', 'second', 'step',
+            ]
+            if not any(ind in transcript_lower for ind in technical_indicators):
+                return "acknowledgment"
+        
+        # --- Check for "both" pattern (ack + long content) ---
+        ack_starters = [
+            "yes ", "yeah ", "yep ", "i'm here ", "im here ", "i am here ",
+            "yes i am here ", "present ", "i'm still here ",
+            "yes i can hear you ", "ok so ", "okay so ", "yes so ",
+        ]
+        for starter in ack_starters:
+            if transcript_lower.startswith(starter):
+                remainder = transcript_lower[len(starter):].strip()
+                if len(remainder.split()) >= 5:
+                    return "both"
+        
+        # --- Long response (>8 words) → technical ---
+        if word_count > 8:
+            return "technical"
+        
+        # --- Ambiguous (5-8 words): LLM classification ---
+        try:
+            last_question = self._find_last_real_question(session_data)
+            if not last_question:
+                return "acknowledgment"
+            
+            classification_prompt = f"""A student was asked a technical question, then went silent. The system asked "Are you still there?" and the student responded:
+
+    Student's response: "{transcript}"
+    The pending technical question was: "{last_question[:100]}"
+
+    Is the student's response:
+    A) Just confirming they're present (e.g., "yes", "I'm here")
+    B) Actually answering the technical question
+    C) Both (confirming presence AND answering)
+
+    Reply with ONLY one letter: A, B, or C"""
+
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                shared_clients.executor,
+                self.conversation_manager._sync_openai_call,
+                classification_prompt,
+            )
+            result = (result or "").strip().upper()
+            
+            if "A" in result:
+                return "acknowledgment"
+            elif "C" in result:
+                return "both"
+            else:
+                return "technical"
+        
+        except Exception as e:
+            logger.warning(f"⚠️ Classification LLM failed: {e}")
+            return "acknowledgment" if word_count <= 6 else "technical"
+
+
+    def _find_last_real_question(self, session_data) -> str:
+        """Find the last REAL technical question, skipping silence prompts."""
+        conv_log = getattr(session_data, "conversation_log", [])
+        
+        for i in range(len(conv_log) - 1, -1, -1):
+            exchange = conv_log[i]
+            user_resp = exchange.get("user_response", "")
+            ai_msg = exchange.get("ai_message", "")
+            stage = exchange.get("stage", "")
+            
+            if user_resp in ("[USER_SILENT]", "[SILENCE_PROMPT_ACKNOWLEDGED]"):
+                continue
+            if stage == "greeting":
+                continue
+            if not ai_msg or len(ai_msg.strip()) < 10:
+                continue
+            if ai_msg.startswith("["):
+                continue
+            
+            ai_lower = ai_msg.lower()
+            silence_phrases = [
+                "are you there", "still with me", "can you hear",
+                "are you still", "hello?", "you there", "are you ready",
+                "just checking", "i'd love to hear", "take your time",
+                "i'm here when", "i'll wait", "no rush",
+                "can you hear me", "still here", "checking the connection",
+            ]
+            if any(phrase in ai_lower for phrase in silence_phrases):
+                continue
+            
+            return ai_msg
+        
+        return None
+
+
+    def _strip_acknowledgment_prefix(self, transcript: str) -> str:
+        """Strip ack prefix from combined response. E.g., 'Yes I'm here, the types are...' → 'the types are...'"""
+        prefixes = [
+            "yes i'm here ", "yes im here ", "yes i am here ",
+            "i'm here ", "im here ", "i am here ",
+            "yes i am present ", "i am present ",
+            "yes i can hear you ", "i can hear you ",
+            "present ", "yes ", "yeah ", "yep ", "ok so ", "okay so ",
+            "yes so ", "yeah so ",
+        ]
+        
+        lower = transcript.lower()
+        for prefix in sorted(prefixes, key=len, reverse=True):
+            if lower.startswith(prefix):
+                remainder = transcript[len(prefix):].strip()
+                if remainder and remainder[0] in '.,;:':
+                    remainder = remainder[1:].strip()
+                if len(remainder) > 5:
+                    return remainder
+        
+        return transcript
 
     def calculate_communication_score(self, session_data) -> dict:
         """
@@ -598,10 +747,10 @@ class UltraFastSessionManagerWithSilenceHandling:
             logger.error(f"❌ Error: {e}", exc_info=True)
             return None
 
-    def _is_similar_question(self, new_question: str, all_asked_questions: List[str]) -> tuple:
+    async def _is_similar_question(self, new_question: str, all_asked_questions: List[str]) -> tuple:
         """
         Check if new question would have SAME ANSWER as ANY previous question.
-        Uses SINGLE LLM call to check against ALL questions at once.
+        Uses word overlap first (fast), then LLM fallback for semantic check.
         
         Returns: (is_duplicate: bool, similar_to: str or None)
         """
@@ -628,11 +777,25 @@ class UltraFastSessionManagerWithSilenceHandling:
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         
         stop_words = {
+            # Standard question words
             'what', 'how', 'why', 'when', 'where', 'which', 'who',
             'is', 'are', 'the', 'a', 'an', 'in', 'of', 'to', 'for', 'on',
             'do', 'does', 'can', 'could', 'would', 'should', 'will',
             'you', 'your', 'it', 'its', 'this', 'that', 'and', 'or',
-            'sap', 'client', 'clients', 'system', 'systems', 'environment'  # Domain words
+            'tell', 'me', 'about', 'describe', 'explain', 'please',
+            # Domain terms (too common in SAP questions)
+            'sap', 'client', 'clients', 'system', 'systems', 'environment', 'environments',
+            # ✅ Common question-framing words that cause false negatives
+            'key', 'main', 'primary', 'important', 'major', 'critical',
+            'differences', 'difference', 'between', 'compared',
+            'considerations', 'factors', 'aspects', 'elements',
+            'steps', 'process', 'procedure', 'involved',
+            'practices', 'best', 'common', 'typical',
+            'potential', 'possible', 'various',
+            'impact', 'impacts', 'implications', 'consequences',
+            'managing', 'handling', 'performing', 'implementing',
+            'associated', 'related', 'regarding', 'concerning',
+            'terms', 'role', 'purpose', 'used',
         }
         
         new_words = {w for w in new_q_clean.split() if w not in stop_words and len(w) > 2}
@@ -643,59 +806,61 @@ class UltraFastSessionManagerWithSilenceHandling:
             
             if new_words and prev_words:
                 common = new_words & prev_words
-                overlap = len(common) / min(len(new_words), len(prev_words))
+                min_len = min(len(new_words), len(prev_words))
+                overlap = len(common) / min_len if min_len > 0 else 0
                 
-                # 80%+ overlap = definitely same question
-                if overlap >= 0.80 and len(common) >= 3:
+                if overlap >= 0.60 and len(common) >= 2:
                     logger.info(f"🔍 High word overlap ({overlap:.0%}): {common}")
                     logger.info(f"   New: {new_question}")
                     logger.info(f"   Similar to: {prev_q}")
                     return True, prev_q
         
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # LLM CHECK: Check against ALL questions (not just last 15)
+        # LLM CHECK: Catch semantic duplicates that word overlap misses
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         
         try:
-            # Use ALL questions, not just last 15
             questions_to_check = all_asked_questions
             prev_questions_text = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions_to_check)])
             
             similarity_prompt = f"""Check if the NEW question would have the SAME ANSWER as ANY of the previous questions.
 
-    PREVIOUS QUESTIONS ({len(questions_to_check)} total):
-    {prev_questions_text}
+PREVIOUS QUESTIONS ({len(questions_to_check)} total):
+{prev_questions_text}
 
-    NEW QUESTION: "{new_question}"
+NEW QUESTION: "{new_question}"
 
-    ═══════════════════════════════════════════════════════════════
-    SAME ANSWER means the core information/facts needed to answer both questions is IDENTICAL.
+═══════════════════════════════════════════════════════════════
+SAME ANSWER means the core information/facts needed to answer both questions is IDENTICAL.
 
-    SAME ANSWER examples:
-    - "risks of improper client administration" vs "risks of improper client management" → SAME (administration = management)
-    - "best practices for securing clients" vs "best practices for securing against unauthorized access" → SAME (both about security best practices)
-    - "implications of client settings on performance" vs "implications of configuration changes on performance" → SAME (settings = configuration)
-    - "types of client copies" vs "methods to transfer data" → SAME (both list: local, remote, export/import)
-    - "steps to do X" vs "how to perform X" vs "process for X" → SAME (all asking for procedure)
-    - "what is X" vs "purpose of X" vs "X is used for" → SAME (all asking definition/purpose)
+SAME ANSWER examples:
+- "risks of improper client administration" vs "risks of improper client management" → SAME
+- "best practices for securing clients" vs "best practices for securing against unauthorized access" → SAME
+- "steps to do X" vs "how to perform X" vs "process for X" → SAME
+- "what is X" vs "purpose of X" vs "X is used for" → SAME
 
-    DIFFERENT ANSWER examples:
-    - "what is X" vs "how to configure X" → DIFFERENT
-    - "types of X" vs "problems with X" → DIFFERENT
-    - "prerequisites for X" vs "best practices for X" → DIFFERENT
-    ═══════════════════════════════════════════════════════════════
+DIFFERENT ANSWER examples:
+- "what is X" vs "how to configure X" → DIFFERENT
+- "types of X" vs "problems with X" → DIFFERENT
+- "prerequisites for X" vs "best practices for X" → DIFFERENT
+═══════════════════════════════════════════════════════════════
 
-    Carefully check EACH previous question. If ANY would have the same answer, reply:
-    SAME:<number>
+Carefully check EACH previous question. If ANY would have the same answer, reply:
+SAME:<number>
 
-    If NEW question requires a genuinely DIFFERENT answer than ALL previous questions, reply:
-    DIFFERENT
+If NEW question requires a genuinely DIFFERENT answer than ALL previous questions, reply:
+DIFFERENT
 
-    Reply with ONLY: SAME:<number> OR DIFFERENT"""
+Reply with ONLY: SAME:<number> OR DIFFERENT"""
 
             logger.info(f"🔍 LLM checking new question against {len(questions_to_check)} previous questions...")
             
-            response = self.conversation_manager._sync_openai_call(similarity_prompt)
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                shared_clients.executor,
+                self.conversation_manager._sync_openai_call,
+                similarity_prompt,
+            )
             response = (response or "").strip().upper()
             
             logger.info(f"🔍 LLM response: {response}")
@@ -718,7 +883,56 @@ class UltraFastSessionManagerWithSilenceHandling:
         except Exception as e:
             logger.warning(f"⚠️ LLM check failed: {e}", exc_info=True)
             return False, None
-    
+
+    def _is_similar_question(self, new_question: str, all_asked_questions: List[str]) -> tuple:
+        """
+        Fast LOCAL duplicate check — no LLM call needed.
+        Uses word overlap comparison. Runs in microseconds instead of 2+ seconds.
+        
+        Returns: (is_duplicate: bool, similar_to: str or None)
+        """
+        if not new_question or not all_asked_questions:
+            return False, None
+        
+        import re
+        
+        new_q_lower = new_question.lower().strip()
+        new_q_clean = re.sub(r'[^\w\s]', '', new_q_lower)
+        
+        stop_words = {
+            'what', 'how', 'why', 'when', 'where', 'which', 'who',
+            'is', 'are', 'the', 'a', 'an', 'in', 'of', 'to', 'for', 'on',
+            'do', 'does', 'can', 'could', 'would', 'should', 'will',
+            'you', 'your', 'it', 'its', 'this', 'that', 'and', 'or',
+            'tell', 'me', 'about', 'describe', 'explain', 'please',
+            'sap', 'client', 'clients', 'system', 'systems', 'environment'
+        }
+        
+        new_words = {w for w in new_q_clean.split() if w not in stop_words and len(w) > 2}
+        
+        for prev_q in all_asked_questions:
+            prev_q_clean = re.sub(r'[^\w\s]', '', prev_q.lower().strip())
+            
+            # Check 1: Exact match
+            if new_q_clean == prev_q_clean:
+                logger.info(f"🔍 Exact duplicate detected: {new_question}")
+                return True, prev_q
+            
+            # Check 2: Word overlap
+            prev_words = {w for w in prev_q_clean.split() if w not in stop_words and len(w) > 2}
+            if new_words and prev_words:
+                common = new_words & prev_words
+                min_len = min(len(new_words), len(prev_words))
+                overlap = len(common) / min_len if min_len > 0 else 0
+                
+                if overlap >= 0.70 and len(common) >= 3:
+                    logger.info(f"🔍 High word overlap ({overlap:.0%}): {common}")
+                    logger.info(f"   New: {new_question}")
+                    logger.info(f"   Similar to: {prev_q}")
+                    return True, prev_q
+        
+        return False, None
+
     async def _force_kill_silence_tts(self, session_id: str, session_data):
         """
         Immediately stop silence TTS when user speaks.
@@ -930,6 +1144,7 @@ class UltraFastSessionManagerWithSilenceHandling:
             session_data.silence_ready = False
             session_data.silence_prompt_active = False
             session_data.has_user_spoken = False
+            session_data.awaiting_silence_acknowledgment = False
             session_data.silence_grace_after_greeting_s = getattr(
                 config, "SILENCE_GRACE_AFTER_GREETING_SECONDS", 4
             )
@@ -1309,6 +1524,9 @@ class UltraFastSessionManagerWithSilenceHandling:
             except Exception as qa_err:
                 logger.error(f"Q&A save failed: {qa_err}")
 
+            # ════ AUTO PDF + S3 UPLOAD ════
+            await _auto_generate_and_upload_pdf(session_data, detailed_evaluation or {}, evaluation_text or "", score or 0)
+
             await self._send_quick_message(session_data, {
                 "type": "conversation_end",
                 "text": closing_text,
@@ -1354,12 +1572,18 @@ class UltraFastSessionManagerWithSilenceHandling:
 
     async def remove_session(self, session_id: str):
         if session_id in self.active_sessions:
+            session_data = self.active_sessions[session_id]
+            # Close WebSocket so frontend knows session is gone
+            if session_data.websocket:
+                try:
+                    await session_data.websocket.close(code=1000)
+                except Exception:
+                    pass
             try:
                 self.tts_processor.end_session(session_id)
             except Exception:
                 pass
             del self.active_sessions[session_id]
-            logger.info("Removed session %s", session_id)
 
     # ============================================================================
     # ✅ IMPROVED: Enhanced audio processing with NOISE FILTERING
@@ -1371,902 +1595,981 @@ class UltraFastSessionManagerWithSilenceHandling:
             logger.warning("Inactive session: %s", session_id)
             return
 
-        # ✅ CRITICAL: Block ALL audio processing while AI is responding
-        if getattr(session_data, "ai_is_responding", False):
-            logger.info(f"⏸️ BLOCKED: AI is responding - ignoring ALL audio (session {session_id})")
-            return
+        # ✅ FIX: Per-session lock — prevents audio + silence from running simultaneously
+        async with session_data.processing_lock:
 
-        # ✅ CRITICAL: Block ALL audio if session is ending
-        if getattr(session_data, "is_ending", False):
-            logger.info(f"🛑 BLOCKED: Session {session_id} is ending - ignoring ALL audio")
-            return
-        
-        # ✅ CRITICAL: 3-second cooldown after AI finishes speaking
-        last_ai_audio_ts = getattr(session_data, "last_ai_audio_ts", 0)
-        if time.time() - last_ai_audio_ts < 3:
-            logger.info(f"⏸️ BLOCKED: AI just finished speaking {time.time() - last_ai_audio_ts:.1f}s ago")
-            return
-
-        start_time = time.time()
-
-        # === HARD WAIT MODE ===
-        if getattr(session_data, "awaiting_user", False):
-            if message_data.get("userStatus") not in ("user_speaking", "user_stopped_speaking") or not message_data.get("audio"):
-                logger.debug(f"⏸️ Ignoring message — still waiting for real speech in {session_id}")
-                return
-            logger.info(f"🎤 User responded — unlocking awaiting_user in {session_id}")
-            session_data.awaiting_user = False
-
-        try:
-            # Extract status info
-            user_status = message_data.get('userStatus', 'unknown')
-            silence_detected_flag = bool(message_data.get('silenceDetected', False))
-            recording_duration = int(message_data.get('recordingDuration', 0))
-            audio_b64 = message_data.get('audio', '') or ''
-
-            # Time limits
-            now_ts = time.time()
-            end_time = getattr(session_data, "end_time", None)
-            if end_time and now_ts >= end_time:
-                if getattr(session_data, "awaiting_user", False):
-                    try:
-                        if audio_b64:
-                            audio_bytes = base64.b64decode(audio_b64)
-                            transcript, quality = await self.audio_processor.transcribe_audio_fast(audio_bytes)
-                            session_data.awaiting_user = False
-                            logger.info("🗣️ User transcript: %s  (quality=%.2f, bytes=%d)",
-                                        (transcript or "").strip(), quality, len(audio_bytes))
-                            if transcript.strip():
-                                ion_data.current_concept or "unknown"
-                                is_followup = getattr(session_data, "_last_question_followup", False)
-                                session_data.add_exchange("[FINAL_ANSWER]", transcript, quality, concept, is_followup)
-                                if session_data.summary_manager:
-                                    session_data.summary_manager.add_answer(transcript)
-                    except Exception as final_err:
-                        logger.error("Final audio processing error: %s", final_err)
-                await self._end_due_to_time(session_data)
+            # ✅ CRITICAL: Block ALL audio processing while AI is responding
+            if getattr(session_data, "ai_is_responding", False):
+                logger.info(f"⏸️ BLOCKED: AI is responding - ignoring ALL audio (session {session_id})")
                 return
 
-            # ---- refined silence gating ----
-            past_greeting_grace = (
-                session_data.greeting_end_ts is not None and
-                (now_ts - session_data.greeting_end_ts) >= session_data.silence_grace_after_greeting_s
-            )
-            has_audio_payload = bool(audio_b64)
-            is_silence_chunk = (
-                not has_audio_payload
-                and session_data.silence_ready
-                and (session_data.has_user_spoken or past_greeting_grace)
-                and (silence_detected_flconcept == sessag or user_status in ('user_silent', 'user_stopped_speaking'))
-            )
-
-            # If the user is speaking → mark spoken but DON'T reset silence counter yet
-            if user_status == 'user_speaking':
-                # ===== Silence interruption logic =====
-                session_data.is_user_speaking_live = True
-                # Kill silence prompt if active (but NOT normal AI responses)
-                if getattr(session_data, "silence_tts_active", False) and not getattr(session_data, "normal_tts_active", False):
-                    logger.info("🛑 User speaking during silence prompt — interrupting")
-                    await self._force_kill_silence_tts(session_id, session_data)
-                    session_data.silence_cooldown_until = time.time() + 1.75
-                
-                session_data.consecutive_silence_chunks = 0
-                session_data.silence_prompt_active = False
-                session_data.has_user_spoken = True
-                session_data.last_user_speech_ts = time.time()
-                
-                # ❌ REMOVED: Don't reset silence counter here - only reset when VALID audio is processed
-                # The counter should only reset when user actually submits meaningful audio
-                
-                # === TRACK RESPONSE TIME FOR COMMUNICATION SCORE ===
-                last_q_ts = getattr(session_data, 'last_question_end_ts', None)
-                if last_q_ts and session_data.current_stage == SessionStage.TECHNICAL:
-                    response_delay = time.time() - last_q_ts
-                    # Only count reasonable delays (ignore if > 60s - probably a different context)
-                    if 0 < response_delay < 60:
-                        if not hasattr(session_data, 'response_times'):
-                            session_data.response_times = []
-                        session_data.response_times.append(response_delay)
-                        logger.info(f"⏱️ Response time recorded: {response_delay:.1f}s (avg: {sum(session_data.response_times)/len(session_data.response_times):.1f}s)")
-                    # Reset to avoid double-counting
-                    session_data.last_question_end_ts = None
-            # Reset live speaking flag when user stops
-            if user_status in ('user_stopped_speaking', 'user_silent'):
-                session_data.is_user_speaking_live = False
+            # ✅ CRITICAL: Block ALL audio if session is ending
+            if getattr(session_data, "is_ending", False):
+                logger.info(f"🛑 BLOCKED: Session {session_id} is ending - ignoring ALL audio")
+                return
             
-            # ---- PATH A: silence chunk → skip STT, use DYNAMIC response ----
-            if is_silence_chunk:
-                session_data.consecutive_silence_chunks += 1
-                logger.info(
-                    "Session %s: silent chunk counted (%d/%d)",
-                    session_id, session_data.consecutive_silence_chunks, session_data.silence_chunks_threshold
-                )
-
-                # Trigger after configured timeout window (~30 s)
-                elapsed_silence = session_data.consecutive_silence_chunks * 5  # ~5 s per chunk
-                if elapsed_silence >= getattr(session_data, "silence_timeout_s", 30):
-                    session_data.consecutive_silence_chunks = 0
-                    
-                    try:
-                        # ✅ Use dynamic silence response generation
-                        ctx = {
-                            "recording_duration": recording_duration,
-                            "user_status": user_status,
-                            "audio_size": len(audio_b64)
-                        }
-                        text = await self.generate_dynamic_silence_response(session_data, ctx)
-                        
-                        # Log and stream
-                        concept = session_data.current_concept or "silence_handling"
-                        session_data.add_exchange(text, "[USER_SILENT]", 0.0, concept, False)
-
-                        session_data.silence_prompt_active = True
-                        await self._send_silence_response_with_audio(session_data, text)
-                        session_data.silence_prompt_active = False
-
-                        soft_cutoff = getattr(session_data, "soft_cutoff_time", None)
-                        if session_data.current_stage == SessionStage.TECHNICAL and (not soft_cutoff or now_ts < soft_cutoff):
-                            session_data.awaiting_user = True
-
-                    except Exception as e_sil:
-                        logger.error("Silence prompt generation/streaming error: %s", e_sil)
-
-                logger.info("Silence handling time: %.2fs", time.time() - start_time)
+            # ✅ CRITICAL: 3-second cooldown after AI finishes speaking
+            last_ai_audio_ts = getattr(session_data, "last_ai_audio_ts", 0)
+            if time.time() - last_ai_audio_ts < 3:
+                logger.info(f"⏸️ BLOCKED: AI just finished speaking {time.time() - last_ai_audio_ts:.1f}s ago")
                 return
 
-            # ---- PATH B: normal audio → run STT ----
-            if not audio_b64:
-                logger.debug("Session %s: no audio data received", session_id)
-                return
+            start_time = time.time()
+            ai_response = None  # ✅ FIX: Initialize to prevent NameError
 
-            audio_bytes = base64.b64decode(audio_b64)
-            logger.info("Session %s: processing normal audio (%d bytes)", session_id, len(audio_bytes))
-            transcript, quality = await self.audio_processor.transcribe_audio_fast(audio_bytes)
-            
-            logger.info("🗣️ User transcript: %s  (quality=%.2f, bytes=%d)",
-                        (transcript or "").strip(), quality, len(audio_bytes))
 
-            # ✅ NEW: BACKGROUND NOISE FILTERING
-            # Minimum audio duration check (at least 0.5 seconds of actual speech)
-            MIN_AUDIO_BYTES = 6000  # ~0.5 seconds at typical bitrates
-            MIN_TRANSCRIPT_LENGTH = 3  # At least 3 characters
-            MIN_QUALITY_SCORE = 0.3  # Minimum quality threshold
-
-            if len(audio_bytes) < MIN_AUDIO_BYTES:
-                logger.info(f"⚠️ Audio too short ({len(audio_bytes)} bytes < {MIN_AUDIO_BYTES}) - likely background noise (sneeze/cough)")
-                return
-
-            if not transcript or len(transcript.strip()) < MIN_TRANSCRIPT_LENGTH:
-                logger.info(f"⚠️ Transcript too short: '{transcript}' ({len(transcript.strip())} chars) - likely background noise")
-                return
-                
-            if quality < MIN_QUALITY_SCORE:
-                logger.info(f"⚠️ Audio quality too low ({quality:.2f} < {MIN_QUALITY_SCORE}) - likely background noise")
-                return
-
-            logger.info(f"✅ Valid audio accepted: {len(audio_bytes)} bytes, quality={quality:.2f}, text='{transcript}'")
-            # ✅ NEW: Only reset silence counter when we have VALID, MEANINGFUL audio
-            if transcript and len(transcript.strip()) > 3:
-                old_count = getattr(session_data, 'silence_response_count', 0)
-                if old_count > 0:
-                    session_data.silence_response_count = 0
-                    logger.info(f"🔄 Valid response - resetting backend silence counter from {old_count} to 0")
-
-            # Reset silence counter and mark spoken on any real transcript
-            if transcript and transcript.strip():
-                session_data.consecutive_silence_chunks = 0
-                session_data.has_user_spoken = True
-                session_data.last_user_speech_ts = time.time()
-
-            # ============================================================================
-            # === SMART RESPONSE HANDLING (REPEAT, SKIP, IRRELEVANT DETECTION) ===
-            # ============================================================================
-            transcript_lower = transcript.lower() if transcript else ""
-
-            # 1. REPEAT REQUEST DETECTION
-            repeat_phrases = ["repeat", "say that again", "what did you say", "didn't catch that", "can you repeat", "pardon", "come again"]
-            if any(phrase in transcript_lower for phrase in repeat_phrases):
-                logger.info("🔁 User requested to repeat the question")
-                
-                # ✅ FIX: Find the last ACTUAL question (skip silence prompts)
-                conv_log = getattr(session_data, "conversation_log", [])
-                last_question = None
-                
-                if conv_log and len(conv_log) > 0:
-                    # Search backwards for the last real question (not a silence prompt)
-                    for i in range(len(conv_log) - 1, -1, -1):
-                        exchange = conv_log[i]
-                        user_resp = exchange.get("user_response", "")
-                        ai_msg = exchange.get("ai_message", "")
-                        stage = exchange.get("stage", "")
-                        
-                        # ✅ Skip silence prompts - they have [USER_SILENT] as user_response
-                        if user_resp == "[USER_SILENT]":
-                            logger.info(f"🔁 Skipping silence prompt at index {i}: '{ai_msg[:50]}...'")
-                            continue
-                        
-                        # ✅ Skip greetings
-                        if stage == "greeting":
-                            logger.info(f"🔁 Skipping greeting at index {i}")
-                            continue
-                        
-                        # ✅ Skip if AI message is too short
-                        if not ai_msg or len(ai_msg.strip()) < 10:
-                            continue
-                        
-                        # ✅ Check if it's a silence prompt phrase
-                        ai_msg_lower = ai_msg.lower()
-                        silence_prompt_phrases = [
-                            "are you there", "still with me", "can you hear", 
-                            "are you still", "hello?", "you there", "are you ready",
-                            "just checking", "i'd love to hear"
-                        ]
-                        if any(phrase in ai_msg_lower for phrase in silence_prompt_phrases):
-                            logger.info(f"🔁 Skipping silence phrase at index {i}: '{ai_msg[:50]}...'")
-                            continue
-                        
-                        # ✅ Found a real question!
-                        last_question = ai_msg
-                        logger.info(f"🔁 Found actual question at index {i}: '{last_question[:50]}...'")
-                        break
-                                
-                    if last_question:
-                        # === UPDATE COMMUNICATION STATS: REPEAT REQUEST (5D) ===
-                        if not hasattr(session_data, 'comm_stats'):
-                            session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
-                        session_data.comm_stats["repeat_requests"] += 1
-                        await self._send_comm_score_update(session_data, "repeat_request")
-                        # ✅ NEW: Extract only the question part, removing acknowledgments
-                        last_question_clean = self._extract_question_only(last_question)
-                        
-                        logger.info(f"🔁 Original response: '{last_question}'")
-                        logger.info(f"🔁 Repeating only question: '{last_question_clean}'")
-                        
-                        # Set AI responding lock 
-                        session_data.ai_is_responding = True
-                        
-                        await self._send_quick_message(session_data, {
-                            "type": "ai_response",
-                            "text": last_question_clean,  # ✅ Send cleaned question only
-                            "status": session_data.current_stage.value,
-                        })
-                        
-                        # Send audio
-                        async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
-                            last_question_clean, session_id=session_data.session_id  # ✅ TTS cleaned question only
-                        ):
-                            if audio_chunk:
-                                await self._send_quick_message(session_data, {
-                                    "type": "audio_chunk",
-                                    "audio": audio_chunk.hex(),
-                                    "status": session_data.current_stage.value,
-                                })
-                        await self._send_quick_message(session_data, {
-                            "type": "audio_end",
-                            "status": session_data.current_stage.value
-                        })
-                        # ✅ LOG THE REPEAT REQUEST
-                        concept = session_data.current_concept or "repeat_request"
-                        session_data.add_exchange(
-                            ai_message=last_question,
-                            user_response=transcript,
-                            quality=0.0,
-                            concept=concept,
-                            is_followup=False
-                        )
-                        logger.info(f"📝 Logged repeat: Q='{last_question[:50]}...', A='{transcript}'")
-
-                        # Release AI responding lock and wait for answer
-                        session_data.ai_is_responding = False
-                        session_data.awaiting_user = True
-                        session_data.last_ai_audio_ts = time.time()
-                        
-                        logger.info("✅ Question repeated successfully")
-                        return
-
-            """repeat_phrases = ["repeat", "say that again", "what did you say", "didn't catch that", "can you repeat", "pardon", "come again"]
-            if any(phrase in transcript_lower for phrase in repeat_phrases):
-                logger.info("🔁 User requested to repeat the question")
-                
-                # Get the last AI question from conversation log
-                conv_log = getattr(session_data, "conversation_log", [])
-                if conv_log and len(conv_log) > 0:
-                    last_question = conv_log[-1].get("ai_message", "")
-                    
-                    if last_question:
-                        logger.info(f"🔁 Repeating last question: '{last_question}'")
-                        
-                        # Set AI responding lock
-                        session_data.ai_is_responding = True
-                        
-                        await self._send_quick_message(session_data, {
-                            "type": "ai_response",
-                            "text": last_question,
-                            "status": session_data.current_stage.value,
-                        })
-                        
-                        # Send audio
-                        async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
-                            last_question, session_id=session_data.session_id
-                        ):
-                            if audio_chunk:
-                                await self._send_quick_message(session_data, {
-                                    "type": "audio_chunk",
-                                    "audio": audio_chunk.hex(),
-                                    "status": session_data.current_stage.value,
-                                })
-                        await self._send_quick_message(session_data, {
-                            "type": "audio_end",
-                            "status": session_data.current_stage.value
-                        })
-                        
-                        # Release AI responding lock and wait for answer
-                        session_data.ai_is_responding = False
-                        session_data.awaiting_user = True
-                        session_data.last_ai_audio_ts = time.time()
-                        
-                        logger.info("✅ Question repeated successfully")
-                        return"""
-            
-            # 2. SKIP/DON'T KNOW DETECTION WITH ACKNOWLEDGMENT
-            # ✅ Only trigger for SHORT, explicit skip requests (not long irrelevant sentences)
-            skip_phrases = [
-                "skip", "skip this", "skip it", "next question", "move on",
-                "i don't know", "dont know", "i do not know", 
-                "can't answer", "cant answer", "cannot answer",
-                "not sure", "no idea", "pass", "i pass",
-                "don't have", "dont have"
-            ]
-
-            transcript_lower = (transcript or "").lower().strip()
-            transcript_words = transcript_lower.split()
-
-            # Check if answer contains a skip phrase
-            contains_skip_phrase = any(phrase in transcript_lower for phrase in skip_phrases)
-
-            # Determine if this is a PURE skip request (not a long irrelevant sentence)
-            is_pure_skip = False
-            if contains_skip_phrase and len(transcript_words) <= 15:
-                # Words that are part of skip phrases (ignore these when counting extra content)
-                skip_words = {
-                    "skip", "i", "dont", "don't", "do", "not", "know", "can't", "cant", 
-                    "cannot", "answer", "sure", "no", "idea", "pass", "this", "it", 
-                    "next", "question", "move", "on", "the", "please", "um", "uh",
-                    "have", "any", "a", "an", "to", "that", "one"
-                }
-                
-                # Count words that are NOT part of skip phrases
-                non_skip_words = [w for w in transcript_words if w.lower() not in skip_words]
-                
-                # Pure skip = 3 or fewer extra words
-                # "I don't know" → 0 non-skip words → SKIP ✅
-                # "I don't know what is happening with me today" → many non-skip words → NOT SKIP ❌
-                is_pure_skip = len(non_skip_words) <= 3
-                
-                logger.info(f"🔍 Skip detection: total_words={len(transcript_words)}, non_skip_words={len(non_skip_words)} {non_skip_words}, is_pure_skip={is_pure_skip}")
-
-            if is_pure_skip:
-                logger.info(f"⏩ User explicitly requested to skip: '{transcript}'")
-
-                # === UPDATE COMMUNICATION STATS: SKIPPED (5B) ===
-                if not hasattr(session_data, 'comm_stats'):
-                    session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
-                session_data.comm_stats["total_questions"] += 1
-                session_data.comm_stats["skipped"] += 1
-                await self._send_comm_score_update(session_data, "skipped")
-                
-                # Generate brief "That's okay" acknowledgment
-                skip_acknowledgments = [
-                    "That's okay!",
-                    "No worries!",
-                    "That's fine!",
-                    "Totally fine!",
-                    "No problem!",
-                ]
-                import random
-                skip_acknowledgment = random.choice(skip_acknowledgments)
-                
-                logger.info(f"✅ Generated skip acknowledgment: '{skip_acknowledgment}'")
-                
-                # Generate next question using auto-advance logic
-                fm = getattr(session_data, "summary_manager", None)
-                if not fm:
-                    logger.error("❌ No fragment manager available")
+            # === HARD WAIT MODE ===
+            if getattr(session_data, "awaiting_user", False):
+                if message_data.get("userStatus") not in ("user_speaking", "user_stopped_speaking") or not message_data.get("audio"):
+                    logger.debug(f"⏸️ Ignoring message — still waiting for real speech in {session_id}")
                     return
-                
-                conv_log = getattr(session_data, "conversation_log", [])
-                current_concept = session_data.current_concept or "unknown"
-                
-                # Count questions on current concept
-                questions_on_concept = sum(
-                    1 for exchange in conv_log 
-                    if exchange.get("concept") == current_concept
+                logger.info(f"🎤 User responded — unlocking awaiting_user in {session_id}")
+                session_data.awaiting_user = False
+
+            try:
+                # Extract status info
+                user_status = message_data.get('userStatus', 'unknown')
+                silence_detected_flag = bool(message_data.get('silenceDetected', False))
+                recording_duration = int(message_data.get('recordingDuration', 0))
+                audio_b64 = message_data.get('audio', '') or ''
+
+                # Time limits
+                now_ts = time.time()
+                end_time = getattr(session_data, "end_time", None)
+                if end_time and now_ts >= end_time:
+                    if getattr(session_data, "awaiting_user", False):
+                        try:
+                            if audio_b64:
+                                audio_bytes = base64.b64decode(audio_b64)
+                                transcript, quality = await self.audio_processor.transcribe_audio_fast(audio_bytes)
+                                session_data.awaiting_user = False
+                                logger.info("🗣️ User transcript: %s  (quality=%.2f, bytes=%d)",
+                                            (transcript or "").strip(), quality, len(audio_bytes))
+                                if transcript.strip():
+                                    concept=session_data.current_concept or "unknown"
+                                    is_followup = getattr(session_data, "_last_question_followup", False)
+                                    session_data.add_exchange("[FINAL_ANSWER]", transcript, quality, concept, is_followup)
+                                    if session_data.summary_manager:
+                                        session_data.summary_manager.add_answer(transcript)
+                        except Exception as final_err:
+                            logger.error("Final audio processing error: %s", final_err)
+                    await self._end_due_to_time(session_data)
+                    return
+
+                # ---- refined silence gating ----
+                past_greeting_grace = (
+                    session_data.greeting_end_ts is not None and
+                    (now_ts - session_data.greeting_end_ts) >= session_data.silence_grace_after_greeting_s
                 )
-                
-                max_questions = getattr(session_data, 'questions_per_concept', 3)
-                should_ask_followup = questions_on_concept < max_questions
-                
-                next_question = None
-                
-                if should_ask_followup:
-                    # Generate follow-up on same concept
-                    logger.info("🔄 Skip: Generating FOLLOW-UP on same concept")
-                    current_concept_title, current_concept_content = fm.get_active_fragment()
+                has_audio_payload = bool(audio_b64)
+                is_silence_chunk = (
+                    not has_audio_payload
+                    and session_data.silence_ready
+                    and (session_data.has_user_spoken or past_greeting_grace)
+                    and (silence_detected_flag or user_status in ('user_silent', 'user_stopped_speaking'))
+                )
+
+                # If the user is speaking → mark spoken but DON'T reset silence counter yet
+                if user_status == 'user_speaking':
+                    # ===== Silence interruption logic =====
+                    session_data.is_user_speaking_live = True
+                    # Kill silence prompt if active (but NOT normal AI responses)
+                    if getattr(session_data, "silence_tts_active", False) and not getattr(session_data, "normal_tts_active", False):
+                        logger.info("🛑 User speaking during silence prompt — interrupting")
+                        await self._force_kill_silence_tts(session_id, session_data)
+                        session_data.silence_cooldown_until = time.time() + 1.75
                     
-                    # Get last question from conversation log
-                    last_question = conv_log[-1].get("ai_message", "") if conv_log else ""
+                    session_data.consecutive_silence_chunks = 0
+                    session_data.silence_prompt_active = False
+                    session_data.has_user_spoken = True
+                    session_data.last_user_speech_ts = time.time()
                     
-                    followup_prompt = prompts.dynamic_followup_response(
-                        context_text=current_concept_content[:2000],
-                        user_input="[User skipped]",
-                        previous_question=last_question,
-                        session_state={
-                            "domain": current_concept,
-                            "questions_asked": questions_on_concept,
-                            "concept": current_concept_title
-                        }
+                    # ❌ REMOVED: Don't reset silence counter here - only reset when VALID audio is processed
+                    # The counter should only reset when user actually submits meaningful audio
+                    
+                    # === TRACK RESPONSE TIME FOR COMMUNICATION SCORE ===
+                    last_q_ts = getattr(session_data, 'last_question_end_ts', None)
+                    if last_q_ts and session_data.current_stage == SessionStage.TECHNICAL:
+                        response_delay = time.time() - last_q_ts
+                        # Only count reasonable delays (ignore if > 60s - probably a different context)
+                        if 0 < response_delay < 60:
+                            if not hasattr(session_data, 'response_times'):
+                                session_data.response_times = []
+                            session_data.response_times.append(response_delay)
+                            logger.info(f"⏱️ Response time recorded: {response_delay:.1f}s (avg: {sum(session_data.response_times)/len(session_data.response_times):.1f}s)")
+                        # Reset to avoid double-counting
+                        session_data.last_question_end_ts = None
+                # Reset live speaking flag when user stops
+                if user_status in ('user_stopped_speaking', 'user_silent'):
+                    session_data.is_user_speaking_live = False
+                
+                # ---- PATH A: silence chunk → skip STT, use DYNAMIC response ----
+                if is_silence_chunk:
+                    session_data.consecutive_silence_chunks += 1
+                    logger.info(
+                        "Session %s: silent chunk counted (%d/%d)",
+                        session_id, session_data.consecutive_silence_chunks, session_data.silence_chunks_threshold
                     )
-                    
-                    loop = asyncio.get_event_loop()
-                    next_question = await loop.run_in_executor(
-                        shared_clients.executor,
-                        self.conversation_manager._sync_openai_call,
-                        followup_prompt,
-                    )
-                    next_question = (next_question or "").strip()
-                    
-                    if not next_question or len(next_question.split()) < 8:
-                        next_question = await loop.run_in_executor(
-                            shared_clients.executor,
-                            self.conversation_manager._sync_openai_call,
-                            followup_prompt,
-                        )
-                        next_question = (next_question or "").strip()
-                    
-                    session_data._last_question_followup = True
-                    if fm:
-                        fm.add_question(next_question, current_concept_title, is_followup=True)
-                else:
-                    # Move to new topic
-                    logger.info("🔄 Skip: Moving to NEW TOPIC")
-                    old_concept = session_data.current_concept
-                    moved = fm.advance_fragment()
-                    
-                    if moved:
-                        new_concept_title, new_concept_content = fm.get_active_fragment()
-                        session_data.current_concept = new_concept_title
-                        session_data.current_domain = new_concept_title
+
+                    # Trigger after configured timeout window (~30 s)
+                    elapsed_silence = session_data.consecutive_silence_chunks * 5  # ~5 s per chunk
+                    if elapsed_silence >= getattr(session_data, "silence_timeout_s", 30):
+                        session_data.consecutive_silence_chunks = 0
                         
-                        transition_prompt = prompts.dynamic_concept_transition(
-                            current_concept=old_concept,
-                            next_concept=new_concept_title,
-                            user_last_answer="[User skipped]",
-                            next_concept_content=new_concept_content
+                        try:
+                            # ✅ Use dynamic silence response generation
+                            ctx = {
+                                "recording_duration": recording_duration,
+                                "user_status": user_status,
+                                "audio_size": len(audio_b64)
+                            }
+                            text = await self.generate_dynamic_silence_response(session_data, ctx)
+                            
+                            # Log and stream
+                            concept = session_data.current_concept or "silence_handling"
+                            session_data.add_exchange(text, "[USER_SILENT]", 0.0, concept, False)
+
+                            session_data.silence_prompt_active = True
+                            await self._send_silence_response_with_audio(session_data, text)
+                            session_data.silence_prompt_active = False
+
+                            soft_cutoff = getattr(session_data, "soft_cutoff_time", None)
+                            if session_data.current_stage == SessionStage.TECHNICAL and (not soft_cutoff or now_ts < soft_cutoff):
+                                session_data.awaiting_user = True
+
+                        except Exception as e_sil:
+                            logger.error("Silence prompt generation/streaming error: %s", e_sil)
+
+                    logger.info("Silence handling time: %.2fs", time.time() - start_time)
+                    return
+
+                # ---- PATH B: normal audio → run STT ----
+                if not audio_b64:
+                    logger.debug("Session %s: no audio data received", session_id)
+                    return
+
+                audio_bytes = base64.b64decode(audio_b64)
+                logger.info("Session %s: processing normal audio (%d bytes)", session_id, len(audio_bytes))
+                transcript, quality = await self.audio_processor.transcribe_audio_fast(audio_bytes)
+                
+                logger.info("🗣️ User transcript: %s  (quality=%.2f, bytes=%d)",
+                            (transcript or "").strip(), quality, len(audio_bytes))
+
+                # ✅ NEW: BACKGROUND NOISE FILTERING
+                # Minimum audio duration check (at least 0.5 seconds of actual speech)
+                MIN_AUDIO_BYTES = 6000  # ~0.5 seconds at typical bitrates
+                MIN_TRANSCRIPT_LENGTH = 3  # At least 3 characters
+                MIN_QUALITY_SCORE = 0.3  # Minimum quality threshold
+
+                if len(audio_bytes) < MIN_AUDIO_BYTES:
+                    logger.info(f"⚠️ Audio too short ({len(audio_bytes)} bytes < {MIN_AUDIO_BYTES}) - likely background noise (sneeze/cough)")
+                    return
+
+                if not transcript or len(transcript.strip()) < MIN_TRANSCRIPT_LENGTH:
+                    logger.info(f"⚠️ Transcript too short: '{transcript}' ({len(transcript.strip())} chars) - likely background noise")
+                    return
+                    
+                if quality < MIN_QUALITY_SCORE:
+                    logger.info(f"⚠️ Audio quality too low ({quality:.2f} < {MIN_QUALITY_SCORE}) - likely background noise")
+                    return
+
+                logger.info(f"✅ Valid audio accepted: {len(audio_bytes)} bytes, quality={quality:.2f}, text='{transcript}'")
+                # ============================================================================
+                # === SILENCE ACKNOWLEDGMENT CLASSIFICATION (Fix for Issue #2) ===
+                # ============================================================================
+                if getattr(session_data, 'awaiting_silence_acknowledgment', False):
+                    logger.info(f"🔍 Silence acknowledgment check: '{transcript}'")
+                    
+                    classification = await self._classify_silence_response(transcript, session_data)
+                    logger.info(f"🔍 Classification result: {classification}")
+                    
+                    if classification == "acknowledgment":
+                        # Pure acknowledgment — don't validate, re-ask the question
+                        logger.info(f"✅ Recognized as silence acknowledgment — re-asking technical question")
+                        session_data.awaiting_silence_acknowledgment = False
+                        
+                        # Reset silence counter
+                        old_count = getattr(session_data, 'silence_response_count', 0)
+                        if old_count > 0:
+                            session_data.silence_response_count = 0
+                            logger.info(f"🔄 Reset silence counter from {old_count} to 0")
+                        
+                        # Find and re-ask the last real technical question
+                        last_real_question = self._find_last_real_question(session_data)
+                        
+                        if last_real_question:
+                            session_data.ai_is_responding = True
+                            
+                            logger.info(f"🔁 Re-asking: '{last_real_question[:60]}...'")
+                            
+                            await self._send_quick_message(session_data, {
+                                "type": "ai_response",
+                                "text": last_real_question,
+                                "status": session_data.current_stage.value,
+                            })
+                            
+                            async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
+                                last_real_question, session_id=session_data.session_id
+                            ):
+                                if audio_chunk:
+                                    await self._send_quick_message(session_data, {
+                                        "type": "audio_chunk",
+                                        "audio": audio_chunk.hex(),
+                                        "status": session_data.current_stage.value,
+                                    })
+                            await self._send_quick_message(session_data, {
+                                "type": "audio_end",
+                                "status": session_data.current_stage.value
+                            })
+                            
+                            session_data.ai_is_responding = False
+                            session_data.last_ai_audio_ts = time.time()
+                            session_data.awaiting_user = True
+                            
+                            # Log as silence acknowledgment (not a scored answer)
+                            concept = session_data.current_concept or "silence_acknowledgment"
+                            session_data.add_exchange(
+                                ai_message="[SILENCE_PROMPT_ACKNOWLEDGED]",
+                                user_response=transcript,
+                                quality=0.0,
+                                concept=concept,
+                                is_followup=False
+                            )
+                            return
+                        else:
+                            logger.warning("⚠️ No previous technical question found to re-ask")
+                            session_data.awaiting_silence_acknowledgment = False
+                    
+                    elif classification == "technical":
+                        # Technical answer — just clear flag, let normal flow handle it
+                        logger.info(f"✅ Technical answer after silence — validating normally")
+                        session_data.awaiting_silence_acknowledgment = False
+                    
+                    elif classification == "both":
+                        # Both ack + technical — strip ack prefix, validate remainder
+                        logger.info(f"✅ Both ack + technical — stripping acknowledgment")
+                        session_data.awaiting_silence_acknowledgment = False
+                        stripped = self._strip_acknowledgment_prefix(transcript)
+                        if stripped and len(stripped.strip()) > 5:
+                            transcript = stripped
+                            logger.info(f"✂️ Stripped to: '{transcript}'")
+                    
+                    else:
+                        session_data.awaiting_silence_acknowledgment = False
+                # ✅ NEW: Only reset silence counter when we have VALID, MEANINGFUL audio
+                if transcript and len(transcript.strip()) > 3:
+                    old_count = getattr(session_data, 'silence_response_count', 0)
+                    if old_count > 0:
+                        session_data.silence_response_count = 0
+                        logger.info(f"🔄 Valid response - resetting backend silence counter from {old_count} to 0")
+
+                # Reset silence counter and mark spoken on any real transcript
+                if transcript and transcript.strip():
+                    session_data.consecutive_silence_chunks = 0
+                    session_data.has_user_spoken = True
+                    session_data.last_user_speech_ts = time.time()
+
+                # ============================================================================
+                # === SMART RESPONSE HANDLING (REPEAT, SKIP, IRRELEVANT DETECTION) ===
+                # ============================================================================
+                transcript_lower = transcript.lower() if transcript else ""
+
+                # 1. REPEAT REQUEST DETECTION
+                repeat_phrases = ["repeat", "say that again", "what did you say", "didn't catch that", "can you repeat", "pardon", "come again"]
+                if any(phrase in transcript_lower for phrase in repeat_phrases):
+                    logger.info("🔁 User requested to repeat the question")
+                    
+                    # ✅ FIX: Find the last ACTUAL question (skip silence prompts)
+                    conv_log = getattr(session_data, "conversation_log", [])
+                    last_question = None
+                    
+                    if conv_log and len(conv_log) > 0:
+                        # Search backwards for the last real question (not a silence prompt)
+                        for i in range(len(conv_log) - 1, -1, -1):
+                            exchange = conv_log[i]
+                            user_resp = exchange.get("user_response", "")
+                            ai_msg = exchange.get("ai_message", "")
+                            stage = exchange.get("stage", "")
+                            
+                            # ✅ Skip silence prompts - they have [USER_SILENT] as user_response
+                            if user_resp == "[USER_SILENT]":
+                                logger.info(f"🔁 Skipping silence prompt at index {i}: '{ai_msg[:50]}...'")
+                                continue
+                            
+                            # ✅ Skip greetings
+                            if stage == "greeting":
+                                logger.info(f"🔁 Skipping greeting at index {i}")
+                                continue
+                            
+                            # ✅ Skip if AI message is too short
+                            if not ai_msg or len(ai_msg.strip()) < 10:
+                                continue
+                            
+                            # ✅ Check if it's a silence prompt phrase
+                            ai_msg_lower = ai_msg.lower()
+                            silence_prompt_phrases = [
+                                "are you there", "still with me", "can you hear", 
+                                "are you still", "hello?", "you there", "are you ready",
+                                "just checking", "i'd love to hear"
+                            ]
+                            if any(phrase in ai_msg_lower for phrase in silence_prompt_phrases):
+                                logger.info(f"🔁 Skipping silence phrase at index {i}: '{ai_msg[:50]}...'")
+                                continue
+                            
+                            # ✅ Found a real question!
+                            last_question = ai_msg
+                            logger.info(f"🔁 Found actual question at index {i}: '{last_question[:50]}...'")
+                            break
+                                    
+                        if last_question:
+                            # === UPDATE COMMUNICATION STATS: REPEAT REQUEST (5D) ===
+                            if not hasattr(session_data, 'comm_stats'):
+                                session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
+                            session_data.comm_stats["repeat_requests"] += 1
+                            await self._send_comm_score_update(session_data, "repeat_request")
+                            # ✅ NEW: Extract only the question part, removing acknowledgments
+                            last_question_clean = self._extract_question_only(last_question)
+                            
+                            logger.info(f"🔁 Original response: '{last_question}'")
+                            logger.info(f"🔁 Repeating only question: '{last_question_clean}'")
+                            
+                            # Set AI responding lock 
+                            session_data.ai_is_responding = True
+                            
+                            await self._send_quick_message(session_data, {
+                                "type": "ai_response",
+                                "text": last_question_clean,  # ✅ Send cleaned question only
+                                "status": session_data.current_stage.value,
+                            })
+                            
+                            # Send audio
+                            async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
+                                last_question_clean, session_id=session_data.session_id  # ✅ TTS cleaned question only
+                            ):
+                                if audio_chunk:
+                                    await self._send_quick_message(session_data, {
+                                        "type": "audio_chunk",
+                                        "audio": audio_chunk.hex(),
+                                        "status": session_data.current_stage.value,
+                                    })
+                            await self._send_quick_message(session_data, {
+                                "type": "audio_end",
+                                "status": session_data.current_stage.value
+                            })
+                            # ✅ LOG THE REPEAT REQUEST
+                            concept = session_data.current_concept or "repeat_request"
+                            session_data.add_exchange(
+                                ai_message=last_question,
+                                user_response=transcript,
+                                quality=0.0,
+                                concept=concept,
+                                is_followup=False
+                            )
+                            logger.info(f"📝 Logged repeat: Q='{last_question[:50]}...', A='{transcript}'")
+
+                            # Release AI responding lock and wait for answer
+                            session_data.ai_is_responding = False
+                            session_data.awaiting_user = True
+                            session_data.last_ai_audio_ts = time.time()
+                            
+                            logger.info("✅ Question repeated successfully")
+                            return
+
+                """repeat_phrases = ["repeat", "say that again", "what did you say", "didn't catch that", "can you repeat", "pardon", "come again"]
+                if any(phrase in transcript_lower for phrase in repeat_phrases):
+                    logger.info("🔁 User requested to repeat the question")
+                    
+                    # Get the last AI question from conversation log
+                    conv_log = getattr(session_data, "conversation_log", [])
+                    if conv_log and len(conv_log) > 0:
+                        last_question = conv_log[-1].get("ai_message", "")
+                        
+                        if last_question:
+                            logger.info(f"🔁 Repeating last question: '{last_question}'")
+                            
+                            # Set AI responding lock
+                            session_data.ai_is_responding = True
+                            
+                            await self._send_quick_message(session_data, {
+                                "type": "ai_response",
+                                "text": last_question,
+                                "status": session_data.current_stage.value,
+                            })
+                            
+                            # Send audio
+                            async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
+                                last_question, session_id=session_data.session_id
+                            ):
+                                if audio_chunk:
+                                    await self._send_quick_message(session_data, {
+                                        "type": "audio_chunk",
+                                        "audio": audio_chunk.hex(),
+                                        "status": session_data.current_stage.value,
+                                    })
+                            await self._send_quick_message(session_data, {
+                                "type": "audio_end",
+                                "status": session_data.current_stage.value
+                            })
+                            
+                            # Release AI responding lock and wait for answer
+                            session_data.ai_is_responding = False
+                            session_data.awaiting_user = True
+                            session_data.last_ai_audio_ts = time.time()
+                            
+                            logger.info("✅ Question repeated successfully")
+                            return"""
+                
+                # 2. SKIP/DON'T KNOW DETECTION WITH ACKNOWLEDGMENT
+                # ✅ Only trigger for SHORT, explicit skip requests (not long irrelevant sentences)
+                skip_phrases = [
+                    "skip", "skip this", "skip it", "next question", "move on",
+                    "i don't know", "dont know", "i do not know", 
+                    "can't answer", "cant answer", "cannot answer",
+                    "not sure", "no idea", "pass", "i pass",
+                    "don't have", "dont have"
+                ]
+
+                transcript_lower = (transcript or "").lower().strip()
+                transcript_words = transcript_lower.split()
+
+                # Check if answer contains a skip phrase
+                contains_skip_phrase = any(phrase in transcript_lower for phrase in skip_phrases)
+
+                # Determine if this is a PURE skip request (not a long irrelevant sentence)
+                is_pure_skip = False
+                if contains_skip_phrase and len(transcript_words) <= 15:
+                    # Words that are part of skip phrases (ignore these when counting extra content)
+                    skip_words = {
+                        "skip", "i", "dont", "don't", "do", "not", "know", "can't", "cant", 
+                        "cannot", "answer", "sure", "no", "idea", "pass", "this", "it", 
+                        "next", "question", "move", "on", "the", "please", "um", "uh",
+                        "have", "any", "a", "an", "to", "that", "one"
+                    }
+                    
+                    # Count words that are NOT part of skip phrases
+                    non_skip_words = [w for w in transcript_words if w.lower() not in skip_words]
+                    
+                    # Pure skip = 3 or fewer extra words
+                    # "I don't know" → 0 non-skip words → SKIP ✅
+                    # "I don't know what is happening with me today" → many non-skip words → NOT SKIP ❌
+                    is_pure_skip = len(non_skip_words) <= 3
+                    
+                    logger.info(f"🔍 Skip detection: total_words={len(transcript_words)}, non_skip_words={len(non_skip_words)} {non_skip_words}, is_pure_skip={is_pure_skip}")
+
+                if is_pure_skip:
+                    logger.info(f"⏩ User explicitly requested to skip: '{transcript}'")
+
+                    # === UPDATE COMMUNICATION STATS: SKIPPED (5B) ===
+                    if not hasattr(session_data, 'comm_stats'):
+                        session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
+                    session_data.comm_stats["total_questions"] += 1
+                    session_data.comm_stats["skipped"] += 1
+                    await self._send_comm_score_update(session_data, "skipped")
+                    
+                    # Generate brief "That's okay" acknowledgment
+                    skip_acknowledgments = [
+                        "That's okay!",
+                        "No worries!",
+                        "That's fine!",
+                        "Totally fine!",
+                        "No problem!",
+                    ]
+                    import random
+                    skip_acknowledgment = random.choice(skip_acknowledgments)
+                    
+                    logger.info(f"✅ Generated skip acknowledgment: '{skip_acknowledgment}'")
+                    
+                    # Generate next question using auto-advance logic
+                    fm = getattr(session_data, "summary_manager", None)
+                    if not fm:
+                        logger.error("❌ No fragment manager available")
+                        return
+                    
+                    conv_log = getattr(session_data, "conversation_log", [])
+                    current_concept = session_data.current_concept or "unknown"
+                    
+                    # Count questions on current concept
+                    questions_on_concept = sum(
+                        1 for exchange in conv_log 
+                        if exchange.get("concept") == current_concept
+                    )
+                    
+                    max_questions = getattr(session_data, 'questions_per_concept', 3)
+                    should_ask_followup = questions_on_concept < max_questions
+                    
+                    next_question = None
+                    
+                    if should_ask_followup:
+                        # Generate follow-up on same concept
+                        logger.info("🔄 Skip: Generating FOLLOW-UP on same concept")
+                        current_concept_title, current_concept_content = fm.get_active_fragment()
+                        
+                        # Get last question from conversation log
+                        last_question = conv_log[-1].get("ai_message", "") if conv_log else ""
+                        
+                        followup_prompt = prompts.dynamic_followup_response(
+                            context_text=current_concept_content[:2000],
+                            user_input="[User skipped]",
+                            previous_question=last_question,
+                            session_state={
+                                "domain": current_concept,
+                                "questions_asked": questions_on_concept,
+                                "concept": current_concept_title
+                            }
                         )
                         
                         loop = asyncio.get_event_loop()
                         next_question = await loop.run_in_executor(
                             shared_clients.executor,
                             self.conversation_manager._sync_openai_call,
-                            transition_prompt,
+                            followup_prompt,
                         )
                         next_question = (next_question or "").strip()
                         
-                        if not next_question or len(next_question.split()) < 10:
+                        if not next_question or len(next_question.split()) < 8:
+                            next_question = await loop.run_in_executor(
+                                shared_clients.executor,
+                                self.conversation_manager._sync_openai_call,
+                                followup_prompt,
+                            )
+                            next_question = (next_question or "").strip()
+                        
+                        session_data._last_question_followup = True
+                        if fm:
+                            fm.add_question(next_question, current_concept_title, is_followup=True)
+                    else:
+                        # Move to new topic
+                        logger.info("🔄 Skip: Moving to NEW TOPIC")
+                        old_concept = session_data.current_concept
+                        moved = fm.advance_fragment()
+                        
+                        if moved:
+                            new_concept_title, new_concept_content = fm.get_active_fragment()
+                            session_data.current_concept = new_concept_title
+                            session_data.current_domain = new_concept_title
+                            
+                            transition_prompt = prompts.dynamic_concept_transition(
+                                current_concept=old_concept,
+                                next_concept=new_concept_title,
+                                user_last_answer="[User skipped]",
+                                next_concept_content=new_concept_content
+                            )
+                            
+                            loop = asyncio.get_event_loop()
                             next_question = await loop.run_in_executor(
                                 shared_clients.executor,
                                 self.conversation_manager._sync_openai_call,
                                 transition_prompt,
                             )
                             next_question = (next_question or "").strip()
-                        
-                        session_data._last_question_followup = False
-                        if fm:
-                            fm.add_question(next_question, new_concept_title, is_followup=False)
-                    else:
-                        # ✅ FIX: Check if we should switch to extended mode instead of ending
-                        now_ts = time.time()
-                        elapsed = now_ts - session_data.created_at
-                        min_duration = getattr(session_data, 'min_session_duration', 15 * 60)
-                        time_remaining = min_duration - elapsed
-                        
-                        if time_remaining > 60:
-                            session_data.extended_mode = True
-                            logger.info(f"🌐 Skip: Summary exhausted - switching to EXTENDED mode ({time_remaining/60:.1f}m left)")
-                            next_question = await self.generate_extended_question(session_data)
-                            if next_question:
-                                session_data._last_question_followup = False
-                                session_data.current_concept = getattr(session_data, 'main_topic', 'extended_question')
-                            else:
-                                await self._finalize_session_with_formal_closing(session_data)
-                                return
-                        else:
-                            logger.info("🏁 No more concepts and time nearly up - ending session")
-                            await self._finalize_session_with_formal_closing(session_data)
-                            return
-                    
-                
-                if not next_question:
-                    logger.error("❌ Failed to generate next question")
-                    return
-                
-                # ✅ COMBINE acknowledgment + next question into ONE response
-                combined_response = f"{skip_acknowledgment} {next_question}"
-                
-                logger.info(f"✅ Combined skip response: '{combined_response}'")
-                
-                # Add to conversation log
-                concept = session_data.current_concept or "skip_handled"
-                is_followup = getattr(session_data, "_last_question_followup", False)
-                session_data.add_exchange(combined_response, "[SKIP]", 0.3, concept, is_followup)
-                
-                # Set AI responding lock
-                session_data.ai_is_responding = True
-                
-                # Send SINGLE combined response
-                await self._send_quick_message(session_data, {
-                    "type": "ai_response",
-                    "text": combined_response,
-                    "status": session_data.current_stage.value,
-                })
-                
-                # Send audio for SINGLE combined response
-                chunk_count = 0
-                async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
-                    combined_response, session_id=session_data.session_id
-                ):
-                    if audio_chunk:
-                        await self._send_quick_message(session_data, {
-                            "type": "audio_chunk",
-                            "audio": audio_chunk.hex(),
-                            "status": session_data.current_stage.value,
-                        })
-                        chunk_count += 1
-                
-                await self._send_quick_message(session_data, {
-                    "type": "audio_end",
-                    "status": session_data.current_stage.value
-                })
-                
-                logger.info(f"🔊 Streamed {chunk_count} audio chunks for skip response")
-                
-                # Release AI responding lock
-                session_data.ai_is_responding = False
-                session_data.last_ai_audio_ts = time.time()
-                session_data.awaiting_user = True
-
-                # ✅ NEW: Reset silence counter after successful skip processing
-                # (User engaged with the system, even if they didn't answer)
-                '''old_count = getattr(session_data, 'silence_response_count', 0)
-                if old_count > 0:
-                    session_data.silence_response_count = 0
-                    logger.info(f"🔄 Skip processed - resetting silence counter from {old_count} to 0")'''
-                
-                logger.info("✅ Skip handled with single combined response")
-                return   
-            # 3. IRRELEVANT ANSWER DETECTION (LLM-BASED) - Only in TECHNICAL stage
-            # 3. IRRELEVANT ANSWER DETECTION (LLM-BASED) - Only in TECHNICAL stage
-            # Replace the existing IRRELEVANT ANSWER DETECTION section in process_audio_with_silence_status
-            
-            # 3. SMART ANSWER VALIDATION (Accepts correct answers from general knowledge)
-            if session_data.current_stage == SessionStage.TECHNICAL:
-                conv_log = getattr(session_data, "conversation_log", [])
-                if conv_log and len(conv_log) > 0 and len(transcript.strip()) > 10:
-                    # Find the last ACTUAL question (skip silence prompts)
-                    last_question = None
-                    
-                    for i in range(len(conv_log) - 1, -1, -1):
-                        exchange = conv_log[i]
-                        user_resp = exchange.get("user_response", "")
-                        ai_msg = exchange.get("ai_message", "")
-                        stage = exchange.get("stage", "")
-                        
-                        # Skip silence prompts
-                        if user_resp == "[USER_SILENT]":
-                            continue
-                        
-                        # Skip greetings
-                        if stage == "greeting":
-                            continue
-                        
-                        # Skip if AI message is too short
-                        if not ai_msg or len(ai_msg.strip()) < 10:
-                            continue
-                        
-                        # Check if it's a silence prompt phrase
-                        ai_msg_lower = ai_msg.lower()
-                        silence_prompt_phrases = [
-                            "are you there", "still with me", "can you hear", 
-                            "are you still", "hello?", "you there", "are you ready",
-                            "just checking", "i'd love to hear"
-                        ]
-                        if any(phrase in ai_msg_lower for phrase in silence_prompt_phrases):
-                            continue
-                        
-                        # Found a real question!
-                        last_question = ai_msg
-                        break
-                    
-                    if last_question:
-                        logger.info(f"🔍 Smart validation: Q='{last_question[:80]}...', A='{transcript[:80]}...'")
-                        
-                        # Get summary context for reference (but not the only source of truth)
-                        summary_context = ""
-                        fm = getattr(session_data, "summary_manager", None)
-                        if fm:
-                            _, content = fm.get_active_fragment()
-                            summary_context = content[:1000] if content else ""
-                        
-                        # Use SMART validation that accepts general knowledge answers
-                        validation_prompt = prompts.smart_answer_validation_prompt(
-                            question=last_question,
-                            answer=transcript,
-                            summary_context=summary_context
-                        )
-
-                        try:
-                            loop = asyncio.get_event_loop()
-                            validation_result = await loop.run_in_executor(
-                                shared_clients.executor,
-                                self.conversation_manager._sync_openai_call,
-                                validation_prompt,
-                            )
-                            validation_result = (validation_result or "").strip().upper()
                             
-                            logger.info(f"🤖 Smart Validation Result: '{validation_result}'")
-                            
-                            # Handle different validation results
-                            if "IRRELEVANT" in validation_result:
-                                logger.info(f"⚠️ Answer is OFF-TOPIC: '{transcript}'")
-
-                                # Update communication stats
-                                if not hasattr(session_data, 'comm_stats'):
-                                    session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
-                                session_data.comm_stats["total_questions"] += 1
-                                session_data.comm_stats["irrelevant"] += 1
-                                await self._send_comm_score_update(session_data, "irrelevant")
-                                
-                                # Generate redirect phrase
-                                redirect_prompt = f"""Generate a VERY SHORT polite statement (max 8 words) that:
-                            1. Indicates the answer wasn't related to the question
-                            2. Does NOT mention "next", "move on"
-                            3. Keep it gentle and non-judgmental
-
-                            Examples:
-                            - "That doesn't answer the question."
-                            - "I don't think that's related."
-                            - "That's not quite what I asked."
-
-                            Generate one now (max 8 words):"""
-                                
-                                redirect = await loop.run_in_executor(
+                            if not next_question or len(next_question.split()) < 10:
+                                next_question = await loop.run_in_executor(
                                     shared_clients.executor,
                                     self.conversation_manager._sync_openai_call,
-                                    redirect_prompt,
+                                    transition_prompt,
                                 )
-                                redirect = (redirect or "").strip()
-                                
-                                if not redirect or len(redirect.split()) > 10:
-                                    redirects = [
-                                        "That doesn't answer the question.",
-                                        "I don't think that's related.",
-                                        "That's not quite what I asked.",
-                                    ]
-                                    import random
-                                    redirect = random.choice(redirects)
-                                
-                                # Generate next question with DUPLICATE CHECKING
-                                fm = getattr(session_data, "summary_manager", None)
-                                if not fm:
-                                    logger.error("❌ No fragment manager available")
+                                next_question = (next_question or "").strip()
+                            
+                            session_data._last_question_followup = False
+                            if fm:
+                                fm.add_question(next_question, new_concept_title, is_followup=False)
+                        else:
+                            # ✅ FIX: Check if we should switch to extended mode instead of ending
+                            now_ts = time.time()
+                            elapsed = now_ts - session_data.created_at
+                            min_duration = getattr(session_data, 'min_session_duration', 15 * 60)
+                            time_remaining = min_duration - elapsed
+                            
+                            if time_remaining > 60:
+                                session_data.extended_mode = True
+                                logger.info(f"🌐 Skip: Summary exhausted - switching to EXTENDED mode ({time_remaining/60:.1f}m left)")
+                                next_question = await self.generate_extended_question(session_data)
+                                if next_question:
+                                    session_data._last_question_followup = False
+                                    session_data.current_concept = getattr(session_data, 'main_topic', 'extended_question')
+                                else:
+                                    await self._finalize_session_with_formal_closing(session_data)
                                     return
-                                
-                                current_concept = session_data.current_concept or "unknown"
-                                questions_on_concept = sum(
-                                    1 for exchange in conv_log 
-                                    if exchange.get("concept") == current_concept
+                            else:
+                                logger.info("🏁 No more concepts and time nearly up - ending session")
+                                await self._finalize_session_with_formal_closing(session_data)
+                                return
+                        
+                    
+                    if not next_question:
+                        logger.error("❌ Failed to generate next question")
+                        return
+                    
+                    # ✅ COMBINE acknowledgment + next question into ONE response
+                    combined_response = f"{skip_acknowledgment} {next_question}"
+                    
+                    logger.info(f"✅ Combined skip response: '{combined_response}'")
+                    
+                    # Add to conversation log
+                    concept = session_data.current_concept or "skip_handled"
+                    is_followup = getattr(session_data, "_last_question_followup", False)
+                    session_data.add_exchange(combined_response, "[SKIP]", 0.3, concept, is_followup)
+                    
+                    # Set AI responding lock
+                    session_data.ai_is_responding = True
+                    
+                    # Send SINGLE combined response
+                    await self._send_quick_message(session_data, {
+                        "type": "ai_response",
+                        "text": combined_response,
+                        "status": session_data.current_stage.value,
+                    })
+                    
+                    # Send audio for SINGLE combined response
+                    chunk_count = 0
+                    async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
+                        combined_response, session_id=session_data.session_id
+                    ):
+                        if audio_chunk:
+                            await self._send_quick_message(session_data, {
+                                "type": "audio_chunk",
+                                "audio": audio_chunk.hex(),
+                                "status": session_data.current_stage.value,
+                            })
+                            chunk_count += 1
+                    
+                    await self._send_quick_message(session_data, {
+                        "type": "audio_end",
+                        "status": session_data.current_stage.value
+                    })
+                    
+                    logger.info(f"🔊 Streamed {chunk_count} audio chunks for skip response")
+                    
+                    # Release AI responding lock
+                    session_data.ai_is_responding = False
+                    session_data.last_ai_audio_ts = time.time()
+                    session_data.awaiting_user = True
+
+                    # ✅ Reset silence counter after successful skip processing
+                    # (User engaged with the system, even if they didn't answer)
+                    old_count = getattr(session_data, 'silence_response_count', 0)
+                    if old_count > 0:
+                        session_data.silence_response_count = 0
+                        logger.info(f"🔄 Skip processed - resetting silence counter from {old_count} to 0")
+                    
+                    logger.info("✅ Skip handled with single combined response")
+                    return   
+                # 3. IRRELEVANT ANSWER DETECTION (LLM-BASED) - Only in TECHNICAL stage
+                # 3. IRRELEVANT ANSWER DETECTION (LLM-BASED) - Only in TECHNICAL stage
+                # Replace the existing IRRELEVANT ANSWER DETECTION section in process_audio_with_silence_status
+                
+                # 3. SMART ANSWER VALIDATION (Accepts correct answers from general knowledge)
+                if session_data.current_stage == SessionStage.TECHNICAL:
+                    conv_log = getattr(session_data, "conversation_log", [])
+                    if conv_log and len(conv_log) > 0 and len(transcript.strip()) > 10:
+                        # Find the last ACTUAL question (skip silence prompts)
+                        last_question = None
+                        
+                        for i in range(len(conv_log) - 1, -1, -1):
+                            exchange = conv_log[i]
+                            user_resp = exchange.get("user_response", "")
+                            ai_msg = exchange.get("ai_message", "")
+                            stage = exchange.get("stage", "")
+                            
+                            # Skip silence prompts
+                            if user_resp == "[USER_SILENT]":
+                                continue
+                            
+                            # Skip greetings
+                            if stage == "greeting":
+                                continue
+                            
+                            # Skip if AI message is too short
+                            if not ai_msg or len(ai_msg.strip()) < 10:
+                                continue
+                            
+                            # Check if it's a silence prompt phrase
+                            ai_msg_lower = ai_msg.lower()
+                            silence_prompt_phrases = [
+                                "are you there", "still with me", "can you hear", 
+                                "are you still", "hello?", "you there", "are you ready",
+                                "just checking", "i'd love to hear"
+                            ]
+                            if any(phrase in ai_msg_lower for phrase in silence_prompt_phrases):
+                                continue
+                            
+                            # Found a real question!
+                            last_question = ai_msg
+                            break
+                        
+                        if last_question:
+                            logger.info(f"🔍 Smart validation: Q='{last_question[:80]}...', A='{transcript[:80]}...'")
+                            
+                            # Get summary context for reference (but not the only source of truth)
+                            summary_context = ""
+                            fm = getattr(session_data, "summary_manager", None)
+                            if fm:
+                                _, content = fm.get_active_fragment()
+                                summary_context = content[:1000] if content else ""
+                            
+                            # Use SMART validation that accepts general knowledge answers
+                            validation_prompt = prompts.smart_answer_validation_prompt(
+                                question=last_question,
+                                answer=transcript,
+                                summary_context=summary_context
+                            )
+
+                            try:
+                                loop = asyncio.get_event_loop()
+                                validation_result = await loop.run_in_executor(
+                                    shared_clients.executor,
+                                    self.conversation_manager._sync_openai_call,
+                                    validation_prompt,
                                 )
+                                validation_result = (validation_result or "").strip().upper()
                                 
-                                max_questions = getattr(session_data, 'questions_per_concept', 3)
-                                should_ask_followup = questions_on_concept < max_questions
+                                logger.info(f"🤖 Smart Validation Result: '{validation_result}'")
                                 
-                                next_question = None
-                                if should_ask_followup:
-                                    # === SKIP FOLLOW-UP WITH DUPLICATE CHECK ===
-                                    logger.info("🔄 Skip: Generating FOLLOW-UP on same concept")
-                                    current_concept_title, current_concept_content = fm.get_active_fragment()
+                                # Handle different validation results
+                                if "IRRELEVANT" in validation_result:
+                                    logger.info(f"⚠️ Answer is OFF-TOPIC: '{transcript}'")
+
+                                    # Update communication stats
+                                    if not hasattr(session_data, 'comm_stats'):
+                                        session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
+                                    session_data.comm_stats["total_questions"] += 1
+                                    session_data.comm_stats["irrelevant"] += 1
+                                    await self._send_comm_score_update(session_data, "irrelevant")
                                     
-                                    # Get last question from conversation log
-                                    last_question = conv_log[-1].get("ai_message", "") if conv_log else ""
+                                    # Generate redirect phrase
+                                    redirect_prompt = f"""Generate a VERY SHORT polite statement (max 8 words) that:
+                                1. Indicates the answer wasn't related to the question
+                                2. Does NOT mention "next", "move on"
+                                3. Keep it gentle and non-judgmental
+
+                                Examples:
+                                - "That doesn't answer the question."
+                                - "I don't think that's related."
+                                - "That's not quite what I asked."
+
+                                Generate one now (max 8 words):"""
                                     
-                                    async def generate_skip_followup_q():
-                                        followup_prompt = prompts.dynamic_followup_response(
-                                            context_text=current_concept_content[:2000],
-                                            user_input="[User skipped]",
-                                            previous_question=last_question,
-                                            session_state={
-                                                "domain": current_concept,
-                                                "questions_asked": questions_on_concept,
-                                                "concept": current_concept_title
-                                            }
-                                        )
-                                        loop = asyncio.get_event_loop()
-                                        return await loop.run_in_executor(
-                                            shared_clients.executor,
-                                            self.conversation_manager._sync_openai_call,
-                                            followup_prompt,
-                                        )
+                                    redirect = await loop.run_in_executor(
+                                        shared_clients.executor,
+                                        self.conversation_manager._sync_openai_call,
+                                        redirect_prompt,
+                                    )
+                                    redirect = (redirect or "").strip()
                                     
-                                    next_question = await self._validate_and_get_unique_question(
-                                        session_data, generate_skip_followup_q,
-                                        concept_title=current_concept_title, max_retries=3
+                                    if not redirect or len(redirect.split()) > 10:
+                                        redirects = [
+                                            "That doesn't answer the question.",
+                                            "I don't think that's related.",
+                                            "That's not quite what I asked.",
+                                        ]
+                                        import random
+                                        redirect = random.choice(redirects)
+                                    
+                                    # Generate next question with DUPLICATE CHECKING
+                                    fm = getattr(session_data, "summary_manager", None)
+                                    if not fm:
+                                        logger.error("❌ No fragment manager available")
+                                        return
+                                    
+                                    current_concept = session_data.current_concept or "unknown"
+                                    questions_on_concept = sum(
+                                        1 for exchange in conv_log 
+                                        if exchange.get("concept") == current_concept
                                     )
                                     
-                                    session_data._last_question_followup = True
-                                    if fm:
-                                        fm.add_question(next_question, current_concept_title, is_followup=True)
-                                else:
-                                    # === SKIP TRANSITION WITH DUPLICATE CHECK ===
-                                    logger.info("🔄 Skip: Moving to NEW TOPIC")
-                                    old_concept = session_data.current_concept
-                                    moved = fm.advance_fragment()
+                                    max_questions = getattr(session_data, 'questions_per_concept', 3)
+                                    should_ask_followup = questions_on_concept < max_questions
                                     
-                                    if moved:
-                                        new_concept_title, new_concept_content = fm.get_active_fragment()
-                                        session_data.current_concept = new_concept_title
-                                        session_data.current_domain = new_concept_title
+                                    next_question = None
+                                    if should_ask_followup:
+                                        # === SKIP FOLLOW-UP WITH DUPLICATE CHECK ===
+                                        logger.info("🔄 Skip: Generating FOLLOW-UP on same concept")
+                                        current_concept_title, current_concept_content = fm.get_active_fragment()
                                         
-                                        async def generate_skip_transition_q():
-                                            transition_prompt = prompts.dynamic_concept_transition(
-                                                current_concept=old_concept,
-                                                next_concept=new_concept_title,
-                                                user_last_answer="[User skipped]",
-                                                next_concept_content=new_concept_content
+                                        # Get last question from conversation log
+                                        last_question = conv_log[-1].get("ai_message", "") if conv_log else ""
+                                        
+                                        async def generate_skip_followup_q():
+                                            followup_prompt = prompts.dynamic_followup_response(
+                                                context_text=current_concept_content[:2000],
+                                                user_input="[User skipped]",
+                                                previous_question=last_question,
+                                                session_state={
+                                                    "domain": current_concept,
+                                                    "questions_asked": questions_on_concept,
+                                                    "concept": current_concept_title
+                                                }
                                             )
                                             loop = asyncio.get_event_loop()
                                             return await loop.run_in_executor(
                                                 shared_clients.executor,
                                                 self.conversation_manager._sync_openai_call,
-                                                transition_prompt,
+                                                followup_prompt,
                                             )
                                         
                                         next_question = await self._validate_and_get_unique_question(
-                                            session_data, generate_skip_transition_q,
-                                            concept_title=new_concept_title, max_retries=3
+                                            session_data, generate_skip_followup_q,
+                                            concept_title=current_concept_title, max_retries=3
                                         )
                                         
-                                        session_data._last_question_followup = False
+                                        session_data._last_question_followup = True
                                         if fm:
-                                            fm.add_question(next_question, new_concept_title, is_followup=False)
+                                            fm.add_question(next_question, current_concept_title, is_followup=True)
                                     else:
-                                        # Check for extended mode
-                                        now_ts = time.time()
-                                        elapsed = now_ts - session_data.created_at
-                                        min_duration = getattr(session_data, 'min_session_duration', 15 * 60)
-                                        time_remaining = min_duration - elapsed
+                                        # === SKIP TRANSITION WITH DUPLICATE CHECK ===
+                                        logger.info("🔄 Skip: Moving to NEW TOPIC")
+                                        old_concept = session_data.current_concept
+                                        moved = fm.advance_fragment()
                                         
-                                        if time_remaining > 60:
-                                            session_data.extended_mode = True
-                                            # generate_extended_question already has duplicate checking
-                                            next_question = await self.generate_extended_question(session_data)
-                                            if next_question:
-                                                session_data._last_question_followup = False
-                                                session_data.current_concept = getattr(session_data, 'main_topic', 'extended_question')
+                                        if moved:
+                                            new_concept_title, new_concept_content = fm.get_active_fragment()
+                                            session_data.current_concept = new_concept_title
+                                            session_data.current_domain = new_concept_title
+                                            
+                                            async def generate_skip_transition_q():
+                                                transition_prompt = prompts.dynamic_concept_transition(
+                                                    current_concept=old_concept,
+                                                    next_concept=new_concept_title,
+                                                    user_last_answer="[User skipped]",
+                                                    next_concept_content=new_concept_content
+                                                )
+                                                loop = asyncio.get_event_loop()
+                                                return await loop.run_in_executor(
+                                                    shared_clients.executor,
+                                                    self.conversation_manager._sync_openai_call,
+                                                    transition_prompt,
+                                                )
+                                            
+                                            next_question = await self._validate_and_get_unique_question(
+                                                session_data, generate_skip_transition_q,
+                                                concept_title=new_concept_title, max_retries=3
+                                            )
+                                            
+                                            session_data._last_question_followup = False
+                                            if fm:
+                                                fm.add_question(next_question, new_concept_title, is_followup=False)
                                         else:
-                                            await self._finalize_session_with_formal_closing(session_data)
-                                            return
-                                
-                                if not next_question:
-                                    logger.error("❌ Failed to generate next question")
+                                            # Check for extended mode
+                                            now_ts = time.time()
+                                            elapsed = now_ts - session_data.created_at
+                                            min_duration = getattr(session_data, 'min_session_duration', 15 * 60)
+                                            time_remaining = min_duration - elapsed
+                                            
+                                            if time_remaining > 60:
+                                                session_data.extended_mode = True
+                                                # generate_extended_question already has duplicate checking
+                                                next_question = await self.generate_extended_question(session_data)
+                                                if next_question:
+                                                    session_data._last_question_followup = False
+                                                    session_data.current_concept = getattr(session_data, 'main_topic', 'extended_question')
+                                            else:
+                                                await self._finalize_session_with_formal_closing(session_data)
+                                                return
+                                    
+                                    if not next_question:
+                                        logger.error("❌ Failed to generate next question")
+                                        return
+                                    
+                                    combined_response = f"{redirect} {next_question}"
+                                    
+                                    concept = session_data.current_concept or "irrelevant_handled"
+                                    is_followup = getattr(session_data, "_last_question_followup", False)
+                                    session_data.add_exchange(combined_response, "[IRRELEVANT]", 0.3, concept, is_followup)
+                                    
+                                    session_data.ai_is_responding = True
+                                    
+                                    await self._send_quick_message(session_data, {
+                                        "type": "ai_response",
+                                        "text": combined_response,
+                                        "status": session_data.current_stage.value,
+                                    })
+                                    
+                                    chunk_count = 0
+                                    async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
+                                        combined_response, session_id=session_data.session_id
+                                    ):
+                                        if audio_chunk:
+                                            await self._send_quick_message(session_data, {
+                                                "type": "audio_chunk",
+                                                "audio": audio_chunk.hex(),
+                                                "status": session_data.current_stage.value,
+                                            })
+                                            chunk_count += 1
+                                    
+                                    await self._send_quick_message(session_data, {
+                                        "type": "audio_end",
+                                        "status": session_data.current_stage.value
+                                    })
+                                    
+                                    session_data.ai_is_responding = False
+                                    session_data.last_ai_audio_ts = time.time()
+                                    session_data.awaiting_user = True
+
+                                    # ✅ Reset silence counter after irrelevant response handled
+                                    # (User engaged, even if off-topic)
+                                    old_count = getattr(session_data, 'silence_response_count', 0)
+                                    if old_count > 0:
+                                        session_data.silence_response_count = 0
+                                        logger.info(f"🔄 Irrelevant handled - resetting silence counter from {old_count} to 0")
+                                    
                                     return
                                 
-                                combined_response = f"{redirect} {next_question}"
-                                
-                                concept = session_data.current_concept or "irrelevant_handled"
-                                is_followup = getattr(session_data, "_last_question_followup", False)
-                                session_data.add_exchange(combined_response, "[IRRELEVANT]", 0.3, concept, is_followup)
-                                
-                                session_data.ai_is_responding = True
-                                
-                                await self._send_quick_message(session_data, {
-                                    "type": "ai_response",
-                                    "text": combined_response,
-                                    "status": session_data.current_stage.value,
-                                })
-                                
-                                chunk_count = 0
-                                async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
-                                    combined_response, session_id=session_data.session_id
-                                ):
-                                    if audio_chunk:
-                                        await self._send_quick_message(session_data, {
-                                            "type": "audio_chunk",
-                                            "audio": audio_chunk.hex(),
-                                            "status": session_data.current_stage.value,
-                                        })
-                                        chunk_count += 1
-                                
-                                await self._send_quick_message(session_data, {
-                                    "type": "audio_end",
-                                    "status": session_data.current_stage.value
-                                })
-                                
-                                session_data.ai_is_responding = False
-                                session_data.last_ai_audio_ts = time.time()
-                                session_data.awaiting_user = True
+                                elif "INCORRECT" in validation_result:
+                                    # Answer is on-topic but factually wrong
+                                    logger.info(f"⚠️ Answer is INCORRECT but on-topic: '{transcript}'")
+                                    
+                                    # Update stats - count as answered but will affect technical score in evaluation
+                                    if not hasattr(session_data, 'comm_stats'):
+                                        session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
+                                    session_data.comm_stats["total_questions"] += 1
+                                    session_data.comm_stats["answered"] += 1  # They tried to answer
+                                    await self._send_comm_score_update(session_data, "answered")
+                                    
+                                    # Continue with normal flow - the evaluation will handle scoring
+                                    # Don't treat incorrect answers as irrelevant
+                                    
+                                elif "PARTIAL" in validation_result:
+                                    # Partial answer - accept it
+                                    logger.info(f"✅ Answer is PARTIALLY correct: '{transcript}'")
+                                    if not hasattr(session_data, 'comm_stats'):
+                                        session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
+                                    session_data.comm_stats["total_questions"] += 1
+                                    session_data.comm_stats["answered"] += 1
+                                    await self._send_comm_score_update(session_data, "answered")
+                                    
+                                else:  # CORRECT
+                                    # Answer is correct (from summary OR general knowledge)
+                                    logger.info(f"✅ Answer is CORRECT: '{transcript}'")
+                                    if not hasattr(session_data, 'comm_stats'):
+                                        session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
+                                    session_data.comm_stats["total_questions"] += 1
+                                    session_data.comm_stats["answered"] += 1
+                                    await self._send_comm_score_update(session_data, "answered")
+                                                                                
+                            except Exception as validation_error:
+                                logger.error(f"❌ Smart validation failed: {validation_error}")
+                                # Continue with normal processing if validation fails
+                                            # Continue with normal processing if relevanc
+                # ============================================================================
+                # === END OF SMART RESPONSE HANDLING ===
+                # ============================================================================
 
-                                # ✅ NEW: Reset silence counter after irrelevant response handled
-                                # (User engaged, even if off-topic)
-                                '''old_count = getattr(session_data, 'silence_response_count', 0)
-                                if old_count > 0:
-                                    session_data.silence_response_count = 0
-                                    logger.info(f"🔄 Irrelevant handled - resetting silence counter from {old_count} to 0")'''
-                                
-                                return
-                            
-                            elif "INCORRECT" in validation_result:
-                                # Answer is on-topic but factually wrong
-                                logger.info(f"⚠️ Answer is INCORRECT but on-topic: '{transcript}'")
-                                
-                                # Update stats - count as answered but will affect technical score in evaluation
-                                if not hasattr(session_data, 'comm_stats'):
-                                    session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
-                                session_data.comm_stats["total_questions"] += 1
-                                session_data.comm_stats["answered"] += 1  # They tried to answer
-                                await self._send_comm_score_update(session_data, "answered")
-                                
-                                # Continue with normal flow - the evaluation will handle scoring
-                                # Don't treat incorrect answers as irrelevant
-                                
-                            elif "PARTIAL" in validation_result:
-                                # Partial answer - accept it
-                                logger.info(f"✅ Answer is PARTIALLY correct: '{transcript}'")
-                                if not hasattr(session_data, 'comm_stats'):
-                                    session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
-                                session_data.comm_stats["total_questions"] += 1
-                                session_data.comm_stats["answered"] += 1
-                                await self._send_comm_score_update(session_data, "answered")
-                                
-                            else:  # CORRECT
-                                # Answer is correct (from summary OR general knowledge)
-                                logger.info(f"✅ Answer is CORRECT: '{transcript}'")
-                                if not hasattr(session_data, 'comm_stats'):
-                                    session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
-                                session_data.comm_stats["total_questions"] += 1
-                                session_data.comm_stats["answered"] += 1
-                                await self._send_comm_score_update(session_data, "answered")
-                                                                            
-                        except Exception as validation_error:
-                            logger.error(f"❌ Smart validation failed: {validation_error}")
-                            # Continue with normal processing if validation fails
-                                        # Continue with normal processing if relevanc
-            # ============================================================================
-            # === END OF SMART RESPONSE HANDLING ===
-            # ============================================================================
+                # Poor transcript handling (clarify → auto-advance)
+                if not transcript or len(transcript.strip()) < 2:
+                    attempt = getattr(session_data, 'clarification_attempts', 0) + 1
+                    session_data.clarification_attempts = attempt
+                    if attempt >= 2:
+                        logger.info("🕐 No valid speech detected (attempt %d) — staying on same question", attempt)
+                        await self._auto_advance_question(session_data)
+                        return
 
-            # Poor transcript handling (clarify → auto-advance)
-            if not transcript or len(transcript.strip()) < 2:
-                attempt = getattr(session_data, 'clarification_attempts', 0) + 1
-                session_data.clarification_attempts = attempt
-                if attempt >= 2:
-                    logger.info("🕐 No valid speech detected (attempt %d) — staying on same question", attempt)
-                    await self._auto_advance_question(session_data)
-                    return
-
-                loop = asyncio.get_event_loop()
-                clarification_prompt = prompts.dynamic_clarification_request({
-                    'clarification_attempts': attempt,
-                    'audio_quality': quality,
-                    'audio_size': len(audio_bytes)
-                })
-                clarification_message = await loop.run_in_executor(
-                    shared_clients.executor,
-                    self.conversation_manager._sync_openai_call,
-                    clarification_prompt,
-                )
-                clarification_message = (clarification_message or "").strip()
-
-                if not clarification_message or len(clarification_message.split()) < 3:
+                    loop = asyncio.get_event_loop()
+                    clarification_prompt = prompts.dynamic_clarification_request({
+                        'clarification_attempts': attempt,
+                        'audio_quality': quality,
+                        'audio_size': len(audio_bytes)
+                    })
                     clarification_message = await loop.run_in_executor(
                         shared_clients.executor,
                         self.conversation_manager._sync_openai_call,
@@ -2274,153 +2577,110 @@ class UltraFastSessionManagerWithSilenceHandling:
                     )
                     clarification_message = (clarification_message or "").strip()
 
-                await self._send_quick_message(session_data, {
-                    "type": "clarification",
-                    "text": (clarification_message or " "),
-                    "status": session_data.current_stage.value,
-                })
-                return
+                    if not clarification_message or len(clarification_message.split()) < 3:
+                        clarification_message = await loop.run_in_executor(
+                            shared_clients.executor,
+                            self.conversation_manager._sync_openai_call,
+                            clarification_prompt,
+                        )
+                        clarification_message = (clarification_message or "").strip()
 
-            # Normal conversation flow
-            session_data.clarification_attempts = 0
-
-            try:
-                inferred = self._infer_domain(transcript)
-                if inferred and inferred != "general":
-                    session_data.current_domain = inferred
-            except Exception as e:
-                logger.debug("Domain inference error: %s", e)
-
-            # Re-check time windows post-STT
-            now_ts = time.time()
-            soft_cutoff = getattr(session_data, "soft_cutoff_time", None)
-            if end_time and now_ts >= end_time:
-                # Add exchange to conversation log
-                concept = session_data.current_concept or "unknown"
-                is_followup = getattr(session_data, "_last_question_followup", False)
-                session_data.add_exchange(ai_response, transcript, quality, concept, is_followup)
-
-                if session_data.summary_manager:
-                    session_data.summary_manager.add_answer(transcript)
-
-                # ✅ FIX: Increment greeting count IMMEDIATELY after adding exchange
-                if session_data.current_stage == SessionStage.GREETING:
-                    session_data.greeting_count = getattr(session_data, "greeting_count", 0) + 1
-                    logger.info(f"📊 Greeting count incremented to {session_data.greeting_count}")
-
-                # === UPDATE COMMUNICATION STATS: ANSWERED (5A) ===
-                if session_data.current_stage == SessionStage.TECHNICAL:
-                    if not hasattr(session_data, 'comm_stats'):
-                        session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
-                    session_data.comm_stats["total_questions"] += 1
-                    session_data.comm_stats["answered"] += 1
-                    await self._send_comm_score_update(session_data, "answered")
-
-                await self._update_session_state_fast(session_data)
-                return
-                
-            elif soft_cutoff and now_ts >= soft_cutoff:
-                concept = session_data.current_concept or "unknown"
-                is_followup = getattr(session_data, "_last_question_followup", False)
-                session_data.add_exchange("", transcript, quality, concept, is_followup)
-                if session_data.summary_manager:
-                    session_data.summary_manager.add_answer(transcript)
-                ai_response = await self.conversation_manager.generate_fast_response(session_data, transcript)
-                session_data.conversation_log[-1]["ai_response"] = ai_response
-                await self._send_response_with_ultra_fast_audio(session_data, ai_response)
-                session_data.awaiting_user = True
-                await self._end_due_to_time(session_data)
-                return
-
-            # === GREETING STAGE PRE-CHECK ===
-            if session_data.current_stage == SessionStage.GREETING:
-                if not transcript or len(transcript.strip().split()) < 2:
-                    logger.info("🕐 User hasn't replied to greeting yet — letting silence handler take over")
+                    await self._send_quick_message(session_data, {
+                        "type": "clarification",
+                        "text": (clarification_message or " "),
+                        "status": session_data.current_stage.value,
+                    })
                     return
 
-            # === SET AI RESPONDING LOCK ===
-            session_data.awaiting_user = False
-            session_data.ai_is_responding = True
+                # Normal conversation flow
+                session_data.clarification_attempts = 0
 
-            # === SMART AI RESPONSE GENERATION WITH TRANSITION DETECTION ===
-            ai_response = None
-            
-            # ============================================================================
-            # ✅ FIXED: GREETING STAGE WITH AUTO-TRANSITION AFTER 2 EXCHANGES
-            # ============================================================================
-            if session_data.current_stage == SessionStage.GREETING:
-                # ✅ NEW: Check greeting count FIRST
-                greeting_count = getattr(session_data, "greeting_count", 0)
-                max_greeting_exchanges = 2  # Hardcoded to 2 exchanges
+                try:
+                    inferred = self._infer_domain(transcript)
+                    if inferred and inferred != "general":
+                        session_data.current_domain = inferred
+                except Exception as e:
+                    logger.debug("Domain inference error: %s", e)
+
+                # Re-check time windows post-STT
+                now_ts = time.time()
+                soft_cutoff = getattr(session_data, "soft_cutoff_time", None)
+                if end_time and now_ts >= end_time:
+                    # ✅ FIX: Only log exchange if ai_response exists
+                    if ai_response:
+                        # Add exchange to conversation log
+                        concept = session_data.current_concept or "unknown"
+                        is_followup = getattr(session_data, "_last_question_followup", False)
+                        session_data.add_exchange(ai_response, transcript, quality, concept, is_followup)
+
+                        if session_data.summary_manager:
+                            session_data.summary_manager.add_answer(transcript)
+
+                        # ✅ FIX: Increment greeting count IMMEDIATELY after adding exchange
+                        if session_data.current_stage == SessionStage.GREETING:
+                            session_data.greeting_count = getattr(session_data, "greeting_count", 0) + 1
+                            logger.info(f"📊 Greeting count incremented to {session_data.greeting_count}")
+
+                        # === UPDATE COMMUNICATION STATS: ANSWERED (5A) ===
+                        if session_data.current_stage == SessionStage.TECHNICAL:
+                            if not hasattr(session_data, 'comm_stats'):
+                                session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
+                            session_data.comm_stats["total_questions"] += 1
+                            session_data.comm_stats["answered"] += 1
+                            await self._send_comm_score_update(session_data, "answered")
+
+                    await self._update_session_state_fast(session_data)
+                    return
+                    
+                elif soft_cutoff and now_ts >= soft_cutoff:
+                    concept = session_data.current_concept or "unknown"
+                    is_followup = getattr(session_data, "_last_question_followup", False)
+                    session_data.add_exchange("", transcript, quality, concept, is_followup)
+                    if session_data.summary_manager:
+                        session_data.summary_manager.add_answer(transcript)
+                    ai_response = await self.conversation_manager.generate_fast_response(session_data, transcript)
+                    session_data.conversation_log[-1]["ai_response"] = ai_response
+                    await self._send_response_with_ultra_fast_audio(session_data, ai_response)
+                    session_data.awaiting_user = True
+                    await self._end_due_to_time(session_data)
+                    return
+
+                # === GREETING STAGE PRE-CHECK ===
+                if session_data.current_stage == SessionStage.GREETING:
+                    if not transcript or len(transcript.strip().split()) < 2:
+                        logger.info("🕐 User hasn't replied to greeting yet — letting silence handler take over")
+                        return
+
+                # === SET AI RESPONDING LOCK ===
+                session_data.awaiting_user = False
+                session_data.ai_is_responding = True
+
+                # === SMART AI RESPONSE GENERATION WITH TRANSITION DETECTION ===
+                ai_response = None
                 
-                logger.info(f"🔍 GREETING CHECK: count={greeting_count}, max={max_greeting_exchanges}")
-                logger.info(f"🔍 Current stage: {session_data.current_stage}")
-                logger.info(f"🔍 User transcript: '{transcript}'")
-                
-                # ✅ FIX 1: Auto-transition after 2 greeting exchanges
-                if greeting_count >= max_greeting_exchanges:
-                    logger.info("🎯 Max greeting exchanges reached - AUTO-TRANSITIONING to TECHNICAL stage")
-                    session_data.current_stage = SessionStage.TECHNICAL
-                    session_data.greeting_count = 999
-                    session_data.awaiting_user_confirmation = False
+                # ============================================================================
+                # ✅ FIXED: GREETING STAGE WITH AUTO-TRANSITION AFTER 2 EXCHANGES
+                # ============================================================================
+                if session_data.current_stage == SessionStage.GREETING:
+                    # ✅ NEW: Check greeting count FIRST
+                    greeting_count = getattr(session_data, "greeting_count", 0)
+                    max_greeting_exchanges = 2  # Hardcoded to 2 exchanges
                     
-                    # Generate first technical question
-                    fm = session_data.summary_manager
-                    if fm:
-                        current_concept_title, current_concept_content = fm.get_active_fragment()
-                        session_data.current_concept = current_concept_title
-                        session_data.current_domain = current_concept_title
-                        
-                        async def generate_first_tech_q():
-                            tech_prompt = prompts.generate_first_technical_question(
-                                concept_title=current_concept_title,
-                                concept_content=current_concept_content,
-                                user_greeting=transcript
-                            )
-                            loop = asyncio.get_event_loop()
-                            return await loop.run_in_executor(
-                                shared_clients.executor,
-                                self.conversation_manager._sync_openai_call,
-                                tech_prompt,
-                            )
-
-                        ai_response = await self._validate_and_get_unique_question(
-                            session_data, generate_first_tech_q, concept_title=current_concept_title, max_retries=3
-                        )
-
-                        logger.info(f"🎯 Generated first technical question: '{ai_response}'")
-                        fm.add_question(ai_response, current_concept_title, is_followup=False)
-                    else:            
-                        logger.error("❌ Fragment manager is None!")
-                        ai_response = await self.conversation_manager.generate_fast_response(session_data, transcript)
-                else:
-                    # ✅ FIX 2: Check for explicit confirmation
-                    user_confirmed = any(phrase in transcript.lower() for phrase in [
-                        "yes", "yeah", "yep", "okay", "ok", "sure", "let's", "lets", "go ahead", "start", "ready"
-                    ])
+                    logger.info(f"🔍 GREETING CHECK: count={greeting_count}, max={max_greeting_exchanges}")
+                    logger.info(f"🔍 Current stage: {session_data.current_stage}")
+                    logger.info(f"🔍 User transcript: '{transcript}'")
                     
-                    awaiting_confirmation = getattr(session_data, "awaiting_user_confirmation", False)
-                    
-                    logger.info(f"🔍 GREETING TRANSITION CHECK:")
-                    logger.info(f"  - User transcript: '{transcript}'")
-                    logger.info(f"  - User confirmed: {user_confirmed}")
-                    logger.info(f"  - Awaiting confirmation: {awaiting_confirmation}")
-                    logger.info(f"  - Greeting count: {greeting_count}/{max_greeting_exchanges}")
-                    
-                    if user_confirmed and awaiting_confirmation:
-                        session_data.awaiting_user_confirmation = False
+                    # ✅ FIX 1: Auto-transition after 2 greeting exchanges
+                    if greeting_count >= max_greeting_exchanges:
+                        logger.info("🎯 Max greeting exchanges reached - AUTO-TRANSITIONING to TECHNICAL stage")
                         session_data.current_stage = SessionStage.TECHNICAL
                         session_data.greeting_count = 999
-                        logger.info("🎯 User confirmed — switching to TECHNICAL stage")
-
+                        session_data.awaiting_user_confirmation = False
+                        
+                        # Generate first technical question
                         fm = session_data.summary_manager
                         if fm:
                             current_concept_title, current_concept_content = fm.get_active_fragment()
-                            
-                            logger.info(f"🎯 Fragment Manager Status:")
-                            logger.info(f"  - Current concept: '{current_concept_title}'")
-                            logger.info(f"  - Content length: {len(current_concept_content) if current_concept_content else 0}")
-                            
                             session_data.current_concept = current_concept_title
                             session_data.current_domain = current_concept_title
                             
@@ -2447,224 +2707,283 @@ class UltraFastSessionManagerWithSilenceHandling:
                             logger.error("❌ Fragment manager is None!")
                             ai_response = await self.conversation_manager.generate_fast_response(session_data, transcript)
                     else:
-                        logger.info("💬 Continuing friendly greeting exchange")
-                        ai_response = await self.conversation_manager.generate_fast_response(session_data, transcript)
-                        
-                        # ✅ FIX 3: Check if AI asked "ready" question and set flag
-                        ai_reply_lower = ai_response.lower()
-                        asked_ready = any(phrase in ai_reply_lower for phrase in [
-                            "shall we", "ready to", "let's discuss", "go over your", "start with", "dive into"
+                        # ✅ FIX 2: Check for explicit confirmation
+                        user_confirmed = any(phrase in transcript.lower() for phrase in [
+                            "yes", "yeah", "yep", "okay", "ok", "sure", "let's", "lets", "go ahead", "start", "ready"
                         ])
                         
-                        if asked_ready:
-                            session_data.awaiting_user_confirmation = True
-                            logger.info("🕊️ AI asked if user is ready - awaiting confirmation")
-            else:                
-                # ============================================================================
-                # === FOLLOW-UP QUESTION LOGIC (Summary-Based) ===
-                # ============================================================================
-                logger.info("🔄 Generating AI response (technical stage)")
-                fm = session_data.summary_manager
-                # Check time remaining for extended mode decision
-                now_ts = time.time()
-                elapsed = now_ts - session_data.created_at
-                min_duration = getattr(session_data, 'min_session_duration', 15 * 60)
-                time_remaining = min_duration - elapsed
-                
-                if not fm:
-                    logger.error("❌ No fragment manager")
-                    ai_response = await self.conversation_manager.generate_fast_response(session_data, transcript)
-                else:
-                    # Check if we're in extended mode
-                    if getattr(session_data, 'extended_mode', False):
-                        logger.info(f"🌐 In EXTENDED mode - generating web-based question ({time_remaining/60:.1f}m remaining)")
-                        ai_response = await self.generate_extended_question(session_data)
+                        awaiting_confirmation = getattr(session_data, "awaiting_user_confirmation", False)
                         
-                        if ai_response:
-                            session_data._last_question_followup = False
-                            session_data.current_concept = getattr(session_data, 'main_topic', 'extended_question')
+                        logger.info(f"🔍 GREETING TRANSITION CHECK:")
+                        logger.info(f"  - User transcript: '{transcript}'")
+                        logger.info(f"  - User confirmed: {user_confirmed}")
+                        logger.info(f"  - Awaiting confirmation: {awaiting_confirmation}")
+                        logger.info(f"  - Greeting count: {greeting_count}/{max_greeting_exchanges}")
+                        
+                        if user_confirmed and awaiting_confirmation:
+                            session_data.awaiting_user_confirmation = False
+                            session_data.current_stage = SessionStage.TECHNICAL
+                            session_data.greeting_count = 999
+                            logger.info("🎯 User confirmed — switching to TECHNICAL stage")
+
+                            fm = session_data.summary_manager
+                            if fm:
+                                current_concept_title, current_concept_content = fm.get_active_fragment()
+                                
+                                logger.info(f"🎯 Fragment Manager Status:")
+                                logger.info(f"  - Current concept: '{current_concept_title}'")
+                                logger.info(f"  - Content length: {len(current_concept_content) if current_concept_content else 0}")
+                                
+                                session_data.current_concept = current_concept_title
+                                session_data.current_domain = current_concept_title
+                                
+                                async def generate_first_tech_q():
+                                    tech_prompt = prompts.generate_first_technical_question(
+                                        concept_title=current_concept_title,
+                                        concept_content=current_concept_content,
+                                        user_greeting=transcript
+                                    )
+                                    loop = asyncio.get_event_loop()
+                                    return await loop.run_in_executor(
+                                        shared_clients.executor,
+                                        self.conversation_manager._sync_openai_call,
+                                        tech_prompt,
+                                    )
+
+                                ai_response = await self._validate_and_get_unique_question(
+                                    session_data, generate_first_tech_q, concept_title=current_concept_title, max_retries=3
+                                )
+
+                                logger.info(f"🎯 Generated first technical question: '{ai_response}'")
+                                fm.add_question(ai_response, current_concept_title, is_followup=False)
+                            else:            
+                                logger.error("❌ Fragment manager is None!")
+                                ai_response = await self.conversation_manager.generate_fast_response(session_data, transcript)
                         else:
-                            # Fallback: check if we should end session
-                            if time_remaining <= 60:
-                                logger.info("🏁 Extended question failed and time nearly up - ending session")
-                                await self._finalize_session_with_formal_closing(session_data)
-                                return
-                            else:
-                                # Try one more time
-                                ai_response = await self.generate_extended_question(session_data)
+                            logger.info("💬 Continuing friendly greeting exchange")
+                            ai_response = await self.conversation_manager.generate_fast_response(session_data, transcript)
+                            
+                            # ✅ FIX 3: Check if AI asked "ready" question and set flag
+                            ai_reply_lower = ai_response.lower()
+                            asked_ready = any(phrase in ai_reply_lower for phrase in [
+                                "shall we", "ready to", "let's discuss", "go over your", "start with", "dive into"
+                            ])
+                            
+                            if asked_ready:
+                                session_data.awaiting_user_confirmation = True
+                                logger.info("🕊️ AI asked if user is ready - awaiting confirmation")
+                else:                
+                    # ============================================================================
+                    # === FOLLOW-UP QUESTION LOGIC (Summary-Based) ===
+                    # ============================================================================
+                    logger.info("🔄 Generating AI response (technical stage)")
+                    fm = session_data.summary_manager
+                    # Check time remaining for extended mode decision
+                    now_ts = time.time()
+                    elapsed = now_ts - session_data.created_at
+                    min_duration = getattr(session_data, 'min_session_duration', 15 * 60)
+                    time_remaining = min_duration - elapsed
+                    
+                    if not fm:
+                        logger.error("❌ No fragment manager")
+                        ai_response = await self.conversation_manager.generate_fast_response(session_data, transcript)
                     else:
-                        # Normal summary-based question generation
-                        frag_details = fm.get_current_fragment_details()
-                        
-                        if not frag_details:
-                            # Summary exhausted - check if we should switch to extended mode
-                            if time_remaining > 60:  # More than 1 minute remaining
-                                session_data.extended_mode = True
-                                logger.info(f"🌐 Summary exhausted - switching to EXTENDED mode ({time_remaining/60:.1f}m remaining)")
-                                ai_response = await self.generate_extended_question(session_data)
-                                if ai_response:
-                                    session_data._last_question_followup = False
-                                    session_data.current_concept = getattr(session_data, 'main_topic', 'extended_question')
+                        # Check if we're in extended mode
+                        if getattr(session_data, 'extended_mode', False):
+                            logger.info(f"🌐 In EXTENDED mode - generating web-based question ({time_remaining/60:.1f}m remaining)")
+                            ai_response = await self.generate_extended_question(session_data)
+                            
+                            if ai_response:
+                                session_data._last_question_followup = False
+                                session_data.current_concept = getattr(session_data, 'main_topic', 'extended_question')
                             else:
-                                # Time to end session
-                                logger.info("🏁 No more fragments and time is up - ending session")
-                                await self._finalize_session_with_formal_closing(session_data)
-                                return
-                        else:
-                            # Continue with normal summary-based logic
-                            current_concept = frag_details['title']
-                            has_example = frag_details.get('has_example', False)
-                            questions_on_current = fm.questions_asked_on_current
-                            
-                            logger.info(f"📊 Current concept: '{current_concept}'")
-                            logger.info(f"📊 Questions asked on this concept: {questions_on_current}")
-                            logger.info(f"📊 Has example: {has_example}")
-                            
-                            # Existing MAIN question, EXAMPLE question, or TRANSITION logic...
-                            # (Keep your existing code here)
-                            
-                            if questions_on_current == 0:
-                                # === CASE 1: MAIN QUESTION (with duplicate check) ===
-                                logger.info("📝 Generating MAIN question from fragment content")
-                                
-                                async def generate_main_q():
-                                    question_prompt = prompts.generate_main_question_from_content(frag_details)
-                                    loop = asyncio.get_event_loop()
-                                    return await loop.run_in_executor(
-                                        shared_clients.executor,
-                                        self.conversation_manager._sync_openai_call,
-                                        question_prompt,
-                                    )
-                                
-                                ai_response = await self._validate_and_get_unique_question(
-                                    session_data, generate_main_q, concept_title=current_concept, max_retries=3
-                                )
-                                
-                                logger.info(f"✅ Generated MAIN question: '{ai_response}'")
-                                fm.add_question(ai_response, current_concept, is_followup=False)
-                                session_data._last_question_followup = False 
-                            elif questions_on_current == 1 and has_example:
-                                # === CASE 2: EXAMPLE QUESTION (with duplicate check) ===
-                                logger.info("📝 Asking for EXAMPLE (has_example=True)")
-                                
-                                conv_log = getattr(session_data, "conversation_log", [])
-                                prev_question = conv_log[-1].get("ai_message", "") if conv_log else ""
-                                
-                                async def generate_example_q():
-                                    example_prompt = prompts.generate_example_question(frag_details, prev_question)
-                                    loop = asyncio.get_event_loop()
-                                    return await loop.run_in_executor(
-                                        shared_clients.executor,
-                                        self.conversation_manager._sync_openai_call,
-                                        example_prompt,
-                                    )
-                                
-                                ai_response = await self._validate_and_get_unique_question(
-                                    session_data, generate_example_q, concept_title=current_concept, max_retries=2
-                                )
-                                
-                                # Fallback if still empty
-                                if not ai_response or len(ai_response) < 10:
-                                    ai_response = "Can you give me an example of that?"
-                                    if not hasattr(session_data, 'asked_questions'):
-                                        session_data.asked_questions = []
-                                    session_data.asked_questions.append(ai_response)
-                                
-                                logger.info(f"✅ Generated EXAMPLE question: '{ai_response}'")
-                                fm.add_question(ai_response, current_concept, is_followup=True)
-                                session_data._last_question_followup = True  
-                            else:
-                                # === CASE 3: MOVE TO NEXT FRAGMENT ===
-                                logger.info("🔄 Moving to NEW TOPIC...")
-                                
-                                old_concept = current_concept
-                                moved = fm.advance_fragment()
-                                
-                                if not moved:
-                                    # No more fragments - check if extended mode needed
-                                    if time_remaining > 60:
-                                        session_data.extended_mode = True
-                                        logger.info(f"🌐 All fragments covered - switching to EXTENDED mode ({time_remaining/60:.1f}m remaining)")
-                                        ai_response = await self.generate_extended_question(session_data)
-                                        if ai_response:
-                                            session_data._last_question_followup = False
-                                    else:
-                                        logger.info("🏁 No more concepts - ending session")
-                                        await self._finalize_session_with_formal_closing(session_data)
-                                        return
+                                # Fallback: check if we should end session
+                                if time_remaining <= 60:
+                                    logger.info("🏁 Extended question failed and time nearly up - ending session")
+                                    await self._finalize_session_with_formal_closing(session_data)
+                                    return
                                 else:
-                                    # Get new fragment
-                                    new_frag = fm.get_current_fragment_details()
-                                    new_concept = new_frag['title']
-                                    new_content = new_frag['content']
+                                    # Try one more time
+                                    ai_response = await self.generate_extended_question(session_data)
+                        else:
+                            # Normal summary-based question generation
+                            frag_details = fm.get_current_fragment_details()
+                            
+                            if not frag_details:
+                                # Summary exhausted - check if we should switch to extended mode
+                                if time_remaining > 60:  # More than 1 minute remaining
+                                    session_data.extended_mode = True
+                                    logger.info(f"🌐 Summary exhausted - switching to EXTENDED mode ({time_remaining/60:.1f}m remaining)")
+                                    ai_response = await self.generate_extended_question(session_data)
+                                    if ai_response:
+                                        session_data._last_question_followup = False
+                                        session_data.current_concept = getattr(session_data, 'main_topic', 'extended_question')
+                                else:
+                                    # Time to end session
+                                    logger.info("🏁 No more fragments and time is up - ending session")
+                                    await self._finalize_session_with_formal_closing(session_data)
+                                    return
+                            else:
+                                # Continue with normal summary-based logic
+                                current_concept = frag_details['title']
+                                has_example = frag_details.get('has_example', False)
+                                questions_on_current = fm.questions_asked_on_current
+                                
+                                logger.info(f"📊 Current concept: '{current_concept}'")
+                                logger.info(f"📊 Questions asked on this concept: {questions_on_current}")
+                                logger.info(f"📊 Has example: {has_example}")
+                                
+                                # Existing MAIN question, EXAMPLE question, or TRANSITION logic...
+                                # (Keep your existing code here)
+                                
+                                if questions_on_current == 0:
+                                    # === CASE 1: MAIN QUESTION (with duplicate check) ===
+                                    logger.info("📝 Generating MAIN question from fragment content")
                                     
-                                    logger.info(f"➡️ Transitioning: '{old_concept}' → '{new_concept}'")
-                                    
-                                    session_data.current_concept = new_concept
-                                    session_data.current_domain = new_concept
-                                    
-                                    # Generate transition question
-                                    # Generate transition question (with duplicate check)
-                                    async def generate_transition_q():
-                                        transition_prompt = prompts.dynamic_concept_transition(
-                                            current_concept=old_concept,
-                                            next_concept=new_concept,
-                                            user_last_answer=transcript,
-                                            next_concept_content=new_content
-                                        )
+                                    async def generate_main_q():
+                                        question_prompt = prompts.generate_main_question_from_content(frag_details)
                                         loop = asyncio.get_event_loop()
                                         return await loop.run_in_executor(
                                             shared_clients.executor,
                                             self.conversation_manager._sync_openai_call,
-                                            transition_prompt,
+                                            question_prompt,
+                                        )
+                                    
+                                    ai_response = await self._validate_and_get_unique_question(
+                                        session_data, generate_main_q, concept_title=current_concept, max_retries=3
+                                    )
+                                    
+                                    logger.info(f"✅ Generated MAIN question: '{ai_response}'")
+                                    fm.add_question(ai_response, current_concept, is_followup=False)
+                                    session_data._last_question_followup = False 
+                                elif questions_on_current == 1 and has_example:
+                                    # === CASE 2: EXAMPLE QUESTION (with duplicate check) ===
+                                    logger.info("📝 Asking for EXAMPLE (has_example=True)")
+                                    
+                                    conv_log = getattr(session_data, "conversation_log", [])
+                                    prev_question = conv_log[-1].get("ai_message", "") if conv_log else ""
+                                    
+                                    async def generate_example_q():
+                                        example_prompt = prompts.generate_example_question(frag_details, prev_question)
+                                        loop = asyncio.get_event_loop()
+                                        return await loop.run_in_executor(
+                                            shared_clients.executor,
+                                            self.conversation_manager._sync_openai_call,
+                                            example_prompt,
+                                        )
+                                    
+                                    ai_response = await self._validate_and_get_unique_question(
+                                        session_data, generate_example_q, concept_title=current_concept, max_retries=2
+                                    )
+                                    
+                                    # Fallback if still empty
+                                    if not ai_response or len(ai_response) < 10:
+                                        ai_response = "Can you give me an example of that?"
+                                        if not hasattr(session_data, 'asked_questions'):
+                                            session_data.asked_questions = []
+                                        session_data.asked_questions.append(ai_response)
+                                    
+                                    logger.info(f"✅ Generated EXAMPLE question: '{ai_response}'")
+                                    fm.add_question(ai_response, current_concept, is_followup=True)
+                                    session_data._last_question_followup = True  
+                                else:
+                                    # === CASE 3: MOVE TO NEXT FRAGMENT ===
+                                    logger.info("🔄 Moving to NEW TOPIC...")
+                                    
+                                    old_concept = current_concept
+                                    moved = fm.advance_fragment()
+                                    
+                                    if not moved:
+                                        # No more fragments - check if extended mode needed
+                                        if time_remaining > 60:
+                                            session_data.extended_mode = True
+                                            logger.info(f"🌐 All fragments covered - switching to EXTENDED mode ({time_remaining/60:.1f}m remaining)")
+                                            ai_response = await self.generate_extended_question(session_data)
+                                            if ai_response:
+                                                session_data._last_question_followup = False
+                                        else:
+                                            logger.info("🏁 No more concepts - ending session")
+                                            await self._finalize_session_with_formal_closing(session_data)
+                                            return
+                                    else:
+                                        # Get new fragment
+                                        new_frag = fm.get_current_fragment_details()
+                                        new_concept = new_frag['title']
+                                        new_content = new_frag['content']
+                                        
+                                        logger.info(f"➡️ Transitioning: '{old_concept}' → '{new_concept}'")
+                                        
+                                        session_data.current_concept = new_concept
+                                        session_data.current_domain = new_concept
+                                        
+                                        # Generate transition question
+                                        # Generate transition question (with duplicate check)
+                                        async def generate_transition_q():
+                                            transition_prompt = prompts.dynamic_concept_transition(
+                                                current_concept=old_concept,
+                                                next_concept=new_concept,
+                                                user_last_answer=transcript,
+                                                next_concept_content=new_content
+                                            )
+                                            loop = asyncio.get_event_loop()
+                                            return await loop.run_in_executor(
+                                                shared_clients.executor,
+                                                self.conversation_manager._sync_openai_call,
+                                                transition_prompt,
+                                            )
+
+                                        ai_response = await self._validate_and_get_unique_question(
+                                            session_data, generate_transition_q, concept_title=new_concept, max_retries=3
                                         )
 
-                                    ai_response = await self._validate_and_get_unique_question(
-                                        session_data, generate_transition_q, concept_title=new_concept, max_retries=3
-                                    )
+                                        logger.info(f"✅ Generated TRANSITION: '{ai_response}'")
+                                        fm.add_question(ai_response, new_concept, is_followup=False)
+                                        session_data._last_question_followup = False
+                    
+                    # Track question for repetition avoidance
+                    if ai_response:
+                        if not hasattr(session_data, 'asked_questions'):
+                            session_data.asked_questions = []
+                        session_data.asked_questions.append(ai_response)
+                # ✅ FIX: Guard against None ai_response before logging/sending
+                if not ai_response or not ai_response.strip():
+                    logger.error("❌ No AI response generated — releasing lock and returning")
+                    session_data.ai_is_responding = False
+                    return
 
-                                    logger.info(f"✅ Generated TRANSITION: '{ai_response}'")
-                                    fm.add_question(ai_response, new_concept, is_followup=False)
-                                    session_data._last_question_followup = False
-                
-                # Track question for repetition avoidance
-                if ai_response:
-                    if not hasattr(session_data, 'asked_questions'):
-                        session_data.asked_questions = []
-                    session_data.asked_questions.append(ai_response)
-            # Add exchange to conversation log
-            concept = session_data.current_concept or "unknown"
-            is_followup = getattr(session_data, "_last_question_followup", False)
-            session_data.add_exchange(ai_response, transcript, quality, concept, is_followup)
+                # Add exchange to conversation log
+                concept = session_data.current_concept or "unknown"
+                is_followup = getattr(session_data, "_last_question_followup", False)
+                session_data.add_exchange(ai_response, transcript, quality, concept, is_followup)
 
-            if session_data.summary_manager:
-                session_data.summary_manager.add_answer(transcript)
+                if session_data.summary_manager:
+                    session_data.summary_manager.add_answer(transcript)
 
-            if session_data.current_stage == SessionStage.GREETING:
-                session_data.greeting_count = getattr(session_data, "greeting_count", 0) + 1
-                logger.info(f"📊 Greeting count incremented to {session_data.greeting_count}")
+                if session_data.current_stage == SessionStage.GREETING:
+                    session_data.greeting_count = getattr(session_data, "greeting_count", 0) + 1
+                    logger.info(f"📊 Greeting count incremented to {session_data.greeting_count}")
 
-            await self._update_session_state_fast(session_data)
-            await self._send_response_with_ultra_fast_audio(session_data, ai_response)
+                await self._update_session_state_fast(session_data)
+                await self._send_response_with_ultra_fast_audio(session_data, ai_response)
 
-            # === RELEASE AI RESPONDING LOCK ===
-            session_data.ai_is_responding = False
-
-            now_ts = time.time()
-            if session_data.current_stage == SessionStage.TECHNICAL and (not soft_cutoff or now_ts < soft_cutoff):
-                session_data.awaiting_user = True
-
-            logger.info("Total audio processing time: %.2fs", time.time() - start_time)
-
-        except Exception as e:
-            logger.error("Enhanced audio processing error: %s", e)
-            if session_data:
+                # === RELEASE AI RESPONDING LOCK ===
                 session_data.ai_is_responding = False
-            await self._send_quick_message(session_data, {
-                "type": "error",
-                "text": "Audio processing error",
-                "status": "error",
-            })
+
+                now_ts = time.time()
+                if session_data.current_stage == SessionStage.TECHNICAL and (not soft_cutoff or now_ts < soft_cutoff):
+                    session_data.awaiting_user = True
+
+                logger.info("Total audio processing time: %.2fs", time.time() - start_time)
+
+            except Exception as e:
+                logger.error("Enhanced audio processing error: %s", e)
+                if session_data:
+                    session_data.ai_is_responding = False
+                await self._send_quick_message(session_data, {
+                    "type": "error",
+                    "text": "Audio processing error",
+                    "status": "error",
+                })
 
     # ============================================================================
     # ✅ FINAL VERSION: Multiple silence responses with working audio
@@ -2686,294 +3005,298 @@ class UltraFastSessionManagerWithSilenceHandling:
             logger.error(f"Active sessions: {list(self.active_sessions.keys())}")
             return
 
-        # ✅ FIX: ADD THIS BLOCK HERE
-        # Reset speaking flag since silence notification means user is NOT speaking
-        if silence_data.get('status') == 'user_silent' or silence_data.get('context') == 'extended_silence':
-            if getattr(session_data, 'is_user_speaking_live', False):
-                logger.info(f"🔇 Resetting is_user_speaking_live = False (was True, but silence detected)")
-            session_data.is_user_speaking_live = False
+        # ✅ FIX: Per-session lock — waits if audio is currently being processed
+        async with session_data.processing_lock:
 
-        # ✅ CRITICAL: Check count FIRST and block immediately if >= 5
-        current_silence_count = getattr(session_data, 'silence_response_count', 0)
-        if current_silence_count >= 5:
-            logger.info(f"🛑 BLOCKED: Already sent {current_silence_count} silence responses - rejecting notification")
-            return
+            # Reset speaking flag since silence notification means user is NOT speaking
+            if silence_data.get('status') == 'user_silent' or silence_data.get('context') == 'extended_silence':
+                if getattr(session_data, 'is_user_speaking_live', False):
+                    logger.info(f"🔇 Resetting is_user_speaking_live = False (was True, but silence detected)")
+                session_data.is_user_speaking_live = False
 
-        # ✅ Block if session is ending
-        if getattr(session_data, "is_ending", False):
-            logger.info(f"🛑 BLOCKED: Session is ending - rejecting silence notification")
-            return
-
-        if not session_data.is_active:
-            logger.error(f"❌ Session {session_id} is not active!")
-            return
-
-         # ===== NEW: Silence cooldown check =====
-        if time.time() < getattr(session_data, "silence_cooldown_until", 0):
-            logger.info(f"⏸️ BLOCKED: Silence cooldown active")
-            return
-
-        # ===== NEW: User speaking check =====
-        if getattr(session_data, "is_user_speaking_live", False):
-            logger.info(f"⏸️ BLOCKED: User is speaking")
-            return
-        
-        # ===== NEW: Cancel flag check =====
-        if getattr(session_data, "cancel_silence_tts", False):
-            logger.info(f"⏸️ BLOCKED: Silence TTS was cancelled")
-            session_data.cancel_silence_tts = False  # Reset for next time
-            return
-        
-        logger.info(f"✅ Session found and active")
-        logger.info(f"✅ silence_ready: {getattr(session_data, 'silence_ready', False)}")
-        logger.info(f"✅ greeting_end_ts: {getattr(session_data, 'greeting_end_ts', None)}")
-        logger.info(f"✅ has_user_spoken: {getattr(session_data, 'has_user_spoken', False)}")
-        
-        # 🔧 CHECK 1: Check if audio is currently being processed (race condition fix)
-        if getattr(session_data, "ai_is_responding", False):
-            logger.info(f"⏸️ BLOCKED: AI is currently responding/processing audio - skipping silence prompt")
-            return
-        logger.info(f"✅ Guard 1 passed: ai_is_responding is False")
-
-        last_ai_audio_ts = getattr(session_data, "last_ai_audio_ts", 0)
-        if time.time() - last_ai_audio_ts < 5:
-            logger.info(f"⏸️ BLOCKED: AI audio just finished speaking, cooldown active")
-            return
-        logger.info(f"✅ Guard 2 passed: AI audio cooldown complete")
-
-        # ✅ Force silence_ready if AI just finished speaking
-        if not getattr(session_data, "silence_ready", False):
-            last_ai_ts = getattr(session_data, "last_ai_ts", 0)
-            if time.time() - last_ai_ts > 2:
-                session_data.silence_ready = True
-                logger.info(f"🟢 Auto-reactivated silence_ready for session {session_id}")
-
-        # === Soft Silence Prompt Handling (awaiting_user mode) ===
-        # === Soft Silence Prompt Handling (awaiting_user mode) ===
-        # === Soft Silence Prompt Handling (awaiting_user mode) ===
-        if getattr(session_data, "awaiting_user", False):
-            silence_for = silence_data.get("silenceDuration", silence_data.get("silenceMs", 0))
-            logger.info(f"🔍 awaiting_user mode: silence_for={silence_for}ms, threshold=5000ms")
-
-            # ✅ COOLDOWN ONLY FOR AWAITING_USER MODE - REDUCED TO 4s FOR 5-SILENCE FLOW
-            last_silence_response_ts = getattr(session_data, "last_silence_response_ts", 0)
-            time_since_last = time.time() - last_silence_response_ts
-            if time_since_last < 4:  # 4 second cooldown (was 6s)
-                logger.info(f"⏸️ BLOCKED (awaiting_user): Silence response sent {time_since_last:.1f}s ago - cooldown active")
+            # ✅ CRITICAL: Check count FIRST and block immediately if >= 5
+            current_silence_count = getattr(session_data, 'silence_response_count', 0)
+            if current_silence_count >= 5:
+                logger.info(f"🛑 BLOCKED: Already sent {current_silence_count} silence responses - rejecting notification")
                 return
-            logger.info(f"✅ Guard 3 passed: Awaiting_user cooldown complete ({time_since_last:.1f}s since last)")
 
-           
-            if silence_for >= 5000:
+            # ✅ Block if session is ending
+            if getattr(session_data, "is_ending", False):
+                logger.info(f"🛑 BLOCKED: Session is ending - rejecting silence notification")
+                return
+
+            if not session_data.is_active:
+                logger.error(f"❌ Session {session_id} is not active!")
+                return
+
+            # ===== Silence cooldown check =====
+            if time.time() < getattr(session_data, "silence_cooldown_until", 0):
+                logger.info(f"⏸️ BLOCKED: Silence cooldown active")
+                return
+
+            # ===== User speaking check =====
+            if getattr(session_data, "is_user_speaking_live", False):
+                logger.info(f"⏸️ BLOCKED: User is speaking")
+                return
+            
+            # ===== Cancel flag check =====
+            if getattr(session_data, "cancel_silence_tts", False):
+                logger.info(f"⏸️ BLOCKED: Silence TTS was cancelled")
+                session_data.cancel_silence_tts = False
+                return
+            
+            logger.info(f"✅ Session found and active")
+            logger.info(f"✅ silence_ready: {getattr(session_data, 'silence_ready', False)}")
+            logger.info(f"✅ greeting_end_ts: {getattr(session_data, 'greeting_end_ts', None)}")
+            logger.info(f"✅ has_user_spoken: {getattr(session_data, 'has_user_spoken', False)}")
+            
+            # 🔧 CHECK 1: Check if audio is currently being processed (race condition fix)
+            if getattr(session_data, "ai_is_responding", False):
+                logger.info(f"⏸️ BLOCKED: AI is currently responding/processing audio - skipping silence prompt")
+                return
+            logger.info(f"✅ Guard 1 passed: ai_is_responding is False")
+
+            last_ai_audio_ts = getattr(session_data, "last_ai_audio_ts", 0)
+            if time.time() - last_ai_audio_ts < 5:
+                logger.info(f"⏸️ BLOCKED: AI audio just finished speaking, cooldown active")
+                return
+            logger.info(f"✅ Guard 2 passed: AI audio cooldown complete")
+
+            # ✅ Force silence_ready if AI just finished speaking
+            if not getattr(session_data, "silence_ready", False):
+                last_ai_ts = getattr(session_data, "last_ai_ts", 0)
+                if time.time() - last_ai_ts > 2:
+                    session_data.silence_ready = True
+                    logger.info(f"🟢 Auto-reactivated silence_ready for session {session_id}")
+
+            # === Soft Silence Prompt Handling (awaiting_user mode) ===
+            # === Soft Silence Prompt Handling (awaiting_user mode) ===
+            # === Soft Silence Prompt Handling (awaiting_user mode) ===
+            if getattr(session_data, "awaiting_user", False):
+                silence_for = silence_data.get("silenceDuration", silence_data.get("silenceMs", 0))
+                logger.info(f"🔍 awaiting_user mode: silence_for={silence_for}ms, threshold=5000ms")
+
+                # ✅ COOLDOWN ONLY FOR AWAITING_USER MODE - REDUCED TO 4s FOR 5-SILENCE FLOW
+                last_silence_response_ts = getattr(session_data, "last_silence_response_ts", 0)
+                time_since_last = time.time() - last_silence_response_ts
+                if time_since_last < 4:  # 4 second cooldown (was 6s)
+                    logger.info(f"⏸️ BLOCKED (awaiting_user): Silence response sent {time_since_last:.1f}s ago - cooldown active")
+                    return
+                logger.info(f"✅ Guard 3 passed: Awaiting_user cooldown complete ({time_since_last:.1f}s since last)")
+
+            
+                if silence_for >= 5000:
+                    try:
+                        logger.info(f"🤫 Generating soft silence prompt (awaiting_user mode, {silence_for}ms)")
+                        text = await self.generate_dynamic_silence_response(session_data, silence_data)
+                        
+                        # 🔧 CHECK: Double-check awaiting_user hasn't changed during generation
+                        if not getattr(session_data, "awaiting_user", False):
+                            logger.info(f"⏸️ User responded during generation - canceling silence prompt")
+                            return
+
+                        concept = getattr(session_data, "current_concept", None) or "silence_handling"
+                        session_data.add_exchange(text, "[USER_SILENT]", 0.0, concept, False)
+                        logger.info(f"📝 Logged silence (awaiting_user): Q='{text[:50]}...', A='[USER_SILENT]'")
+                        
+                        # ✅ FIX: Check if this WILL BE the 5th silence BEFORE sending audio
+                        # (silence_response_count is already incremented in generate_dynamic_silence_response)
+                        is_final_silence = session_data.silence_response_count >= 5
+                        
+                        if is_final_silence:
+                            logger.info(f"🔔 This is the FINAL silence response #{session_data.silence_response_count}")
+                            # ✅ Mark inactive IMMEDIATELY to block any new silence notifications
+                            session_data.is_active = False
+                            session_data.awaiting_user = False
+                            session_data.is_ending = True
+                            
+                            # Cancel 15-min watchdog
+                            task = getattr(session_data, "_hard_stop_task", None)
+                            if task and not task.done():
+                                task.cancel()
+                        
+                        # ✅ Send with is_final flag so frontend knows to stop listening
+                        await self._send_silence_response_with_audio(session_data, text, is_final=is_final_silence)
+                        session_data.awaiting_silence_acknowledgment = True
+                        
+                        # ✅ UPDATE TIMESTAMP AFTER SUCCESSFUL SEND
+                        session_data.last_silence_response_ts = time.time()
+                        
+                        logger.info(f"✅ Soft silence prompt delivered ({silence_for} ms)")
+                        
+                        # ✅ END SESSION AFTER 5TH SILENCE - WAIT FOR AUDIO TO PLAY
+                        if is_final_silence:
+                            logger.info(f"🛑🛑🛑 5 SILENCES REACHED - WAITING FOR AUDIO TO FINISH")
+                            
+                            # ✅ Wait for the 5th audio to FINISH PLAYING on frontend
+                            logger.info(f"⏳ Waiting 8 seconds for audio to finish playing...")
+                            await asyncio.sleep(8)
+                            
+                            logger.info(f"📤 Sending conversation_end message...")
+                            
+                            # Send conversation_end
+                            await self._send_quick_message(session_data, {
+                                "type": "conversation_end",
+                                "text": "Session ended due to no response.",
+                                "status": "complete",
+                                "redirect_to": "/student/daily-standups",
+                                "enable_new_session": True,
+                            })
+                            
+                            # Wait for frontend to process
+                            await asyncio.sleep(1)
+                            
+                            # Close WebSocket
+                            if session_data.websocket:
+                                try:
+                                    await session_data.websocket.close(code=1000)
+                                except:
+                                    pass
+                            
+                            # Remove session
+                            await self.remove_session(session_data.session_id)
+                            logger.info(f"✅✅✅ SESSION CLOSED AFTER 5 SILENCES")
+                            return
+                        
+                    except Exception as e_sil:
+                        logger.error(f"❌ Silence prompt generation/streaming error: {e_sil}", exc_info=True)
+                return
+            # === Main Silence Handling (normal mode) - NO COOLDOWN ===
+            logger.info(f"🔍 Entering main silence handling (normal mode) - MULTIPLE RESPONSES ALLOWED")
+            try:
+                # Guard: silence_ready check
+                if not getattr(session_data, "silence_ready", False):
+                    logger.warning(f"⚠️ BLOCKED: silence_ready is False")
+                    return
+                logger.info(f"✅ Guard 4 passed: silence_ready is True")
+
+                now_ts = time.time()
+
+                # Guard: recordingActive check
+                if silence_data.get('recordingActive'):
+                    logger.debug(f"⚠️ BLOCKED: recordingActive is True")
+                    return
+                logger.info(f"✅ Guard 5 passed: recordingActive is False")
+
+                # Guard: speech cooldown check
+                cooldown_s = getattr(config, "SILENCE_COOLDOWN_AFTER_SPEECH_SECONDS", 2.0)
+                last_speech_ts = getattr(session_data, "last_user_speech_ts", None)
+                if last_speech_ts is not None and (now_ts - last_speech_ts) < cooldown_s:
+                    logger.debug(f"⚠️ BLOCKED: within {cooldown_s}s speech cooldown")
+                    return
+                logger.info(f"✅ Guard 6 passed: past speech cooldown")
+
+                # Guard: grace period check
+                past_greeting_grace = (
+                    getattr(session_data, "greeting_end_ts", None) is not None and
+                    (now_ts - session_data.greeting_end_ts) >= getattr(
+                        session_data, "silence_grace_after_greeting_s", 4
+                    )
+                )
+
+                if not (getattr(session_data, "has_user_spoken", False) or past_greeting_grace):
+                    logger.debug(f"⚠️ BLOCKED: no prior speech and still in grace window")
+                    return
+                logger.info(f"✅ Guard 7 passed: has_user_spoken or past grace period")
+
+                # Guard: threshold check
+                session_data.consecutive_silence_chunks = getattr(session_data, "consecutive_silence_chunks", 0) + 1
+                threshold = getattr(session_data, "silence_chunks_threshold", getattr(config, "SILENCE_CHUNKS_THRESHOLD", 1))
+                logger.info(f"🔢 Silence chunks: {session_data.consecutive_silence_chunks}/{threshold}")
+
+                if session_data.consecutive_silence_chunks < threshold:
+                    logger.info(f"⚠️ BLOCKED: Not enough silence chunks yet")
+                    return
+                logger.info(f"✅ Guard 8 passed: threshold reached")
+
+                # Reset counter
+                session_data.consecutive_silence_chunks = 0
+
+                logger.info(f"🎯 All guards passed - generating silence response NOW (response #{getattr(session_data, 'silence_response_count', 0) + 1})")
+
+                # 🔧 Final check before generation
+                if getattr(session_data, "ai_is_responding", False):
+                    logger.info(f"⏸️ BLOCKED: Audio started processing after guards - canceling silence prompt")
+                    return
+
                 try:
-                    logger.info(f"🤫 Generating soft silence prompt (awaiting_user mode, {silence_for}ms)")
+                    # Generate dynamic silence response
                     text = await self.generate_dynamic_silence_response(session_data, silence_data)
-                    
-                    # 🔧 CHECK: Double-check awaiting_user hasn't changed during generation
-                    if not getattr(session_data, "awaiting_user", False):
+
+                    logger.info(f"📝 Generated silence text: '{text}'")
+                    # === UPDATE COMMUNICATION STATS: SILENT (5E) ===
+                    if session_data.current_stage == SessionStage.TECHNICAL:
+                        if not hasattr(session_data, 'comm_stats'):
+                            session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
+                        # Only count if a question was asked
+                        if session_data.comm_stats["total_questions"] > 0 or getattr(session_data, 'last_question_end_ts', None):
+                            session_data.comm_stats["silent"] += 1
+                            await self._send_comm_score_update(session_data, "silent")
+
+                    # ✅ CRITICAL: Check if this is the 5th silence - if so, mark session as ENDING
+                    if session_data.silence_response_count >= 5:
+                        logger.info(f"🛑 This is silence #{session_data.silence_response_count} - marking session as ENDING")
+                        session_data.is_ending = True  # ✅ NEW FLAG - blocks all further processing
+                        session_data.awaiting_user = False  # ✅ Stop waiting for user
+
+                    # 🔧 Final check before sending
+                    if getattr(session_data, "ai_is_responding", False):
                         logger.info(f"⏸️ User responded during generation - canceling silence prompt")
                         return
 
-                    concept = getattr(session_data, "current_concept", None) or "silence_handling"
-                    session_data.add_exchange(text, "[USER_SILENT]", 0.0, concept, False)
-                    logger.info(f"📝 Logged silence (awaiting_user): Q='{text[:50]}...', A='[USER_SILENT]'")
-                    
-                    # ✅ FIX: Check if this WILL BE the 5th silence BEFORE sending audio
-                    # (silence_response_count is already incremented in generate_dynamic_silence_response)
-                    is_final_silence = session_data.silence_response_count >= 5
-                    
-                    if is_final_silence:
-                        logger.info(f"🔔 This is the FINAL silence response #{session_data.silence_response_count}")
-                        # ✅ Mark inactive IMMEDIATELY to block any new silence notifications
+                    # Send the response with audio
+                    await self._send_silence_response_with_audio(session_data, text)
+                    session_data.awaiting_silence_acknowledgment = True
+
+                    logger.info(f"✅ Silence response #{session_data.silence_response_count} sent successfully")
+
+                    # ✅ END SESSION IMMEDIATELY AFTER 5TH SILENCE
+                    # ✅ END SESSION AFTER 5TH SILENCE
+                    if session_data.silence_response_count >= 5:
+                        logger.info(f"🛑 ENDING SESSION - 5 silences")
+        
                         session_data.is_active = False
-                        session_data.awaiting_user = False
-                        session_data.is_ending = True
                         
-                        # Cancel 15-min watchdog
+                        # Cancel the 15-min watchdog
                         task = getattr(session_data, "_hard_stop_task", None)
                         if task and not task.done():
                             task.cancel()
-                    
-                    # ✅ Send with is_final flag so frontend knows to stop listening
-                    await self._send_silence_response_with_audio(session_data, text, is_final=is_final_silence)
-                    
-                    # ✅ UPDATE TIMESTAMP AFTER SUCCESSFUL SEND
-                    session_data.last_silence_response_ts = time.time()
-                    
-                    logger.info(f"✅ Soft silence prompt delivered ({silence_for} ms)")
-                    
-                    # ✅ END SESSION AFTER 5TH SILENCE - WAIT FOR AUDIO TO PLAY
-                    if is_final_silence:
-                        logger.info(f"🛑🛑🛑 5 SILENCES REACHED - WAITING FOR AUDIO TO FINISH")
                         
-                        # ✅ Wait for the 5th audio to FINISH PLAYING on frontend
-                        logger.info(f"⏳ Waiting 8 seconds for audio to finish playing...")
-                        await asyncio.sleep(8)
+                        await asyncio.sleep(2)
                         
-                        logger.info(f"📤 Sending conversation_end message...")
-                        
-                        # Send conversation_end
+                        # ✅ USE conversation_end (frontend handles this)
                         await self._send_quick_message(session_data, {
                             "type": "conversation_end",
-                            "text": "Session ended due to no response.",
+                            "text": "Session ended.",
                             "status": "complete",
-                            "redirect_to": "/student/daily-standups",
+                            "redirect_to": "/dashboard",
                             "enable_new_session": True,
                         })
                         
-                        # Wait for frontend to process
-                        await asyncio.sleep(1)
-                        
-                        # Close WebSocket
                         if session_data.websocket:
                             try:
                                 await session_data.websocket.close(code=1000)
                             except:
                                 pass
                         
-                        # Remove session
                         await self.remove_session(session_data.session_id)
-                        logger.info(f"✅✅✅ SESSION CLOSED AFTER 5 SILENCES")
+                        logger.info(f"✅ Session closed after 5 silences")
                         return
-                    
+                    # ✅ NO TIMESTAMP UPDATE IN NORMAL MODE - Allow multiple responses!
+                    # This allows the system to keep encouraging the user every ~6 seconds
+
+                    # Set awaiting_user if in technical stage
+                    soft_cutoff = getattr(session_data, "soft_cutoff_time", None)
+                    if (session_data.current_stage == SessionStage.TECHNICAL and
+                        (soft_cutoff is None or now_ts < soft_cutoff)):
+                        session_data.awaiting_user = True
+
                 except Exception as e_sil:
                     logger.error(f"❌ Silence prompt generation/streaming error: {e_sil}", exc_info=True)
-            return
-        # === Main Silence Handling (normal mode) - NO COOLDOWN ===
-        logger.info(f"🔍 Entering main silence handling (normal mode) - MULTIPLE RESPONSES ALLOWED")
-        try:
-            # Guard: silence_ready check
-            if not getattr(session_data, "silence_ready", False):
-                logger.warning(f"⚠️ BLOCKED: silence_ready is False")
-                return
-            logger.info(f"✅ Guard 4 passed: silence_ready is True")
 
-            now_ts = time.time()
-
-            # Guard: recordingActive check
-            if silence_data.get('recordingActive'):
-                logger.debug(f"⚠️ BLOCKED: recordingActive is True")
-                return
-            logger.info(f"✅ Guard 5 passed: recordingActive is False")
-
-            # Guard: speech cooldown check
-            cooldown_s = getattr(config, "SILENCE_COOLDOWN_AFTER_SPEECH_SECONDS", 2.0)
-            last_speech_ts = getattr(session_data, "last_user_speech_ts", None)
-            if last_speech_ts is not None and (now_ts - last_speech_ts) < cooldown_s:
-                logger.debug(f"⚠️ BLOCKED: within {cooldown_s}s speech cooldown")
-                return
-            logger.info(f"✅ Guard 6 passed: past speech cooldown")
-
-            # Guard: grace period check
-            past_greeting_grace = (
-                getattr(session_data, "greeting_end_ts", None) is not None and
-                (now_ts - session_data.greeting_end_ts) >= getattr(
-                    session_data, "silence_grace_after_greeting_s", 4
-                )
-            )
-
-            if not (getattr(session_data, "has_user_spoken", False) or past_greeting_grace):
-                logger.debug(f"⚠️ BLOCKED: no prior speech and still in grace window")
-                return
-            logger.info(f"✅ Guard 7 passed: has_user_spoken or past grace period")
-
-            # Guard: threshold check
-            session_data.consecutive_silence_chunks = getattr(session_data, "consecutive_silence_chunks", 0) + 1
-            threshold = getattr(session_data, "silence_chunks_threshold", getattr(config, "SILENCE_CHUNKS_THRESHOLD", 1))
-            logger.info(f"🔢 Silence chunks: {session_data.consecutive_silence_chunks}/{threshold}")
-
-            if session_data.consecutive_silence_chunks < threshold:
-                logger.info(f"⚠️ BLOCKED: Not enough silence chunks yet")
-                return
-            logger.info(f"✅ Guard 8 passed: threshold reached")
-
-            # Reset counter
-            session_data.consecutive_silence_chunks = 0
-
-            logger.info(f"🎯 All guards passed - generating silence response NOW (response #{getattr(session_data, 'silence_response_count', 0) + 1})")
-
-            # 🔧 Final check before generation
-            if getattr(session_data, "ai_is_responding", False):
-                logger.info(f"⏸️ BLOCKED: Audio started processing after guards - canceling silence prompt")
-                return
-
-            try:
-                # Generate dynamic silence response
-                text = await self.generate_dynamic_silence_response(session_data, silence_data)
-
-                logger.info(f"📝 Generated silence text: '{text}'")
-                # === UPDATE COMMUNICATION STATS: SILENT (5E) ===
-                if session_data.current_stage == SessionStage.TECHNICAL:
-                    if not hasattr(session_data, 'comm_stats'):
-                        session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
-                    # Only count if a question was asked
-                    if session_data.comm_stats["total_questions"] > 0 or getattr(session_data, 'last_question_end_ts', None):
-                        session_data.comm_stats["silent"] += 1
-                        await self._send_comm_score_update(session_data, "silent")
-
-                # ✅ CRITICAL: Check if this is the 5th silence - if so, mark session as ENDING
-                if session_data.silence_response_count >= 5:
-                    logger.info(f"🛑 This is silence #{session_data.silence_response_count} - marking session as ENDING")
-                    session_data.is_ending = True  # ✅ NEW FLAG - blocks all further processing
-                    session_data.awaiting_user = False  # ✅ Stop waiting for user
-
-                # 🔧 Final check before sending
-                if getattr(session_data, "ai_is_responding", False):
-                    logger.info(f"⏸️ User responded during generation - canceling silence prompt")
-                    return
-
-                # Send the response with audio
-                await self._send_silence_response_with_audio(session_data, text)
-
-                logger.info(f"✅ Silence response #{session_data.silence_response_count} sent successfully")
-
-                # ✅ END SESSION IMMEDIATELY AFTER 5TH SILENCE
-                # ✅ END SESSION AFTER 5TH SILENCE
-                if session_data.silence_response_count >= 5:
-                    logger.info(f"🛑 ENDING SESSION - 5 silences")
-    
-                    session_data.is_active = False
-                    
-                    # Cancel the 15-min watchdog
-                    task = getattr(session_data, "_hard_stop_task", None)
-                    if task and not task.done():
-                        task.cancel()
-                    
-                    await asyncio.sleep(2)
-                    
-                    # ✅ USE conversation_end (frontend handles this)
-                    await self._send_quick_message(session_data, {
-                        "type": "conversation_end",
-                        "text": "Session ended.",
-                        "status": "complete",
-                        "redirect_to": "/dashboard",
-                        "enable_new_session": True,
-                    })
-                    
-                    if session_data.websocket:
-                        try:
-                            await session_data.websocket.close(code=1000)
-                        except:
-                            pass
-                    
-                    await self.remove_session(session_data.session_id)
-                    logger.info(f"✅ Session closed after 5 silences")
-                    return
-                # ✅ NO TIMESTAMP UPDATE IN NORMAL MODE - Allow multiple responses!
-                # This allows the system to keep encouraging the user every ~6 seconds
-
-                # Set awaiting_user if in technical stage
-                soft_cutoff = getattr(session_data, "soft_cutoff_time", None)
-                if (session_data.current_stage == SessionStage.TECHNICAL and
-                    (soft_cutoff is None or now_ts < soft_cutoff)):
-                    session_data.awaiting_user = True
-
-            except Exception as e_sil:
-                logger.error(f"❌ Silence prompt generation/streaming error: {e_sil}", exc_info=True)
-
-        except Exception as e:
-            logger.error(f"❌ Silence notification processing error: {e}", exc_info=True)
-            
+            except Exception as e:
+                logger.error(f"❌ Silence notification processing error: {e}", exc_info=True)
+                
     # ============================================================================
     # ✅ METHOD 2: Reuse working audio generation (BEST APPROACH)
     # ============================================================================
@@ -3114,6 +3437,40 @@ class UltraFastSessionManagerWithSilenceHandling:
 
         except Exception as e:
             logger.error(f"❌ Silence response audio error: {e}", exc_info=True)'''
+
+    async def process_default_answer(self, session_id: str, default_text: str):
+        """Handle default/placeholder answer from frontend when user doesn't respond in time."""
+        try:
+            session_data = self.active_sessions.get(session_id)
+            if not session_data or not session_data.is_active:
+                logger.warning("Inactive session for default answer: %s", session_id)
+                return
+
+            async with session_data.processing_lock:
+                logger.info(f"📝 Processing default answer for session {session_id}: '{default_text}'")
+
+                # Treat as a skip — user couldn't answer
+                session_data.awaiting_user = False
+
+                # Update communication stats
+                if session_data.current_stage == SessionStage.TECHNICAL:
+                    if not hasattr(session_data, 'comm_stats'):
+                        session_data.comm_stats = {"total_questions": 0, "answered": 0, "skipped": 0, "silent": 0, "irrelevant": 0, "repeat_requests": 0}
+                    session_data.comm_stats["total_questions"] += 1
+                    session_data.comm_stats["skipped"] += 1
+                    await self._send_comm_score_update(session_data, "default_answer")
+
+                # Log the exchange
+                concept = session_data.current_concept or "default_answer"
+                is_followup = getattr(session_data, "_last_question_followup", False)
+                session_data.add_exchange("[DEFAULT_ANSWER]", default_text, 0.2, concept, is_followup)
+
+                # Auto-advance to next question
+                await self._auto_advance_question(session_data)
+
+        except Exception as e:
+            logger.error(f"❌ Default answer processing error: {e}", exc_info=True)
+
     # Legacy method - redirect to new audio processing
     async def process_audio_ultra_fast(self, session_id: str, audio_data: bytes):
         """Legacy method - convert to new format and use enhanced processing"""
@@ -3254,6 +3611,9 @@ class UltraFastSessionManagerWithSilenceHandling:
             save_success = await self.db_manager.save_session_result_fast(session_data, evaluation_text, score)
             if not save_success:
                 logger.error("Failed to save session %s", session_data.session_id)
+
+            # ════ AUTO PDF + S3 UPLOAD ════
+            await _auto_generate_and_upload_pdf(session_data, detailed_evaluation, evaluation_text, score)
 
             await self._send_quick_message(session_data, {
                 "type": "conversation_end",
@@ -3419,6 +3779,9 @@ class UltraFastSessionManagerWithSilenceHandling:
                 evaluation_text = "Evaluation encountered an error."
                 score = 50.0
             
+            # ════ AUTO PDF + S3 UPLOAD ════
+            await _auto_generate_and_upload_pdf(session_data, detailed_evaluation, evaluation_text, score)
+
             # ✅ FIX 2: Send stop_audio FIRST to clear frontend queue
             await self._send_quick_message(session_data, {
                 "type": "stop_audio",
@@ -3641,35 +4004,30 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    from core.mongo_pool import close_pool
+    close_pool()  # ✅ Clean up shared MongoDB pool
     await shared_clients.close_connections()
     await session_manager.db_manager.close_connections()
-    # ✅ ADD THIS: Cleanup biometric services
     if biometric_service:
         biometric_service.disconnect()
     logger.info("Enhanced Daily Standup application shutting down")
 
 @app.get("/start_test")
 async def start_standup_session_fast(student_id: int = None):
-    """
-    Start standup session.
-    
-    Args:
-        student_id: Logged-in student's ID from ADMINORG_ROUGH
-    
-    Example: /start_test?student_id=38
-    """
     session_data = None
     try:
         logger.info("Starting enhanced standup session with silence detection...")
 
-        if len(session_manager.active_sessions) > 0:
-            for sid in list(session_manager.active_sessions.keys()):
-                await session_manager.remove_session(sid)
-                logger.info(f"🧹 Purged stale session {sid} before new start")
+        # ✅ FIX: Per-student lock prevents duplicate sessions from double-clicks
+        student_lock = await session_manager._get_student_lock(student_id)
+        async with student_lock:
+            if len(session_manager.active_sessions) > 0:
+                for sid in list(session_manager.active_sessions.keys()):
+                    existing = session_manager.active_sessions[sid]
+                    if existing.student_id == student_id:
+                        await session_manager.remove_session(sid)
 
-        
-        session_data = await session_manager.create_session_fast(student_id=student_id)
-
+            session_data = await session_manager.create_session_fast(student_id=student_id)
         logger.info("Enhanced session created: %s", session_data.test_id)
         return {
             "status": "success",
@@ -4157,6 +4515,145 @@ def get_rating(score: float) -> str:
     else:
         return "Poor"
 
+def upload_pdf_to_s3(pdf_bytes: bytes, session_id: str, student_id: int = None, report_type: str = "daily_standup") -> str:
+    """
+    Upload PDF report to AWS S3 and return the URL.
+    
+    Args:
+        pdf_bytes: PDF file content
+        session_id: Session identifier
+        student_id: Student ID for folder organization
+        report_type: Type of report (daily_standup, mock_test, weekly_interview)
+        
+    Returns:
+        S3 URL string or None if upload fails
+    """
+    try:
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID', config.AWS_ACCESS_KEY_ID),
+            aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY', config.AWS_SECRET_ACCESS_KEY),
+            region_name=os.environ.get('AWS_REGION', config.AWS_REGION)
+        )
+        
+        bucket_name = os.environ.get('AWS_S3_BUCKET_NAME', config.AWS_S3_BUCKET_NAME)
+        
+        # S3 key: daily-standup-reports/student_38/standup_eval_session123_20260219.pdf
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        s3_key = f"{report_type}-reports/student_{student_id or 'unknown'}/{report_type}_eval_{session_id}_{timestamp}.pdf"
+        
+        # Upload
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=s3_key,
+            Body=pdf_bytes,
+            ContentType='application/pdf',
+            ContentDisposition=f'inline; filename="{report_type}_evaluation_{session_id}.pdf"',
+            Metadata={
+                'session_id': session_id,
+                'student_id': str(student_id or ''),
+                'report_type': report_type,
+                'generated_at': datetime.now().isoformat()
+            }
+        )
+        
+        # Construct URL
+        region = os.environ.get('AWS_REGION', config.AWS_REGION)
+        s3_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{s3_key}"
+        
+        logger.info(f"☁️ {report_type} PDF uploaded to S3: {s3_url}")
+        return s3_url
+        
+    except ClientError as e:
+        logger.error(f"❌ S3 upload failed: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"❌ Unexpected S3 error: {e}")
+        return None
+
+
+def update_standup_result_with_pdf_url(session_id: str, pdf_url: str):
+    """
+    Update the daily_standup_results document (type=session_result) with pdf_url.
+    """
+    try:
+        from core.mongo_pool import get_db  # ✅ Use shared pool
+        
+        db = get_db()
+        collection = db["daily_standup_results"]
+        
+        # Update the session_result document with pdf_url
+        result = collection.update_one(
+            {
+                "session_id": session_id,
+                "type": "session_result"
+            },
+            {
+                "$set": {
+                    "pdf_url": pdf_url,
+                    "pdf_generated_at": datetime.now().isoformat()
+                }
+            }
+        )
+        
+        if result.modified_count > 0:
+            logger.info(f"✅ pdf_url stored in MongoDB for session: {session_id}")
+        else:
+            # Try without type filter (fallback for older documents)
+            result2 = collection.update_one(
+                {"session_id": session_id},
+                {
+                    "$set": {
+                        "pdf_url": pdf_url,
+                        "pdf_generated_at": datetime.now().isoformat()
+                    }
+                }
+            )
+            if result2.modified_count > 0:
+                logger.info(f"✅ pdf_url stored in MongoDB (fallback) for session: {session_id}")
+            else:
+                logger.warning(f"⚠️ No document found to update for session: {session_id}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to update MongoDB with pdf_url: {e}")
+        return False
+
+async def _auto_generate_and_upload_pdf(session_data, detailed_evaluation, evaluation_text, score):
+    """Auto-generate PDF, upload to S3, store URL in MongoDB during session finalization."""
+    try:
+        result = {
+            "student_name": session_data.student_name,
+            "student_id": session_data.student_id,
+            "score": score,
+            "evaluation": evaluation_text,
+            "total_exchanges": len(getattr(session_data, "conversation_log", [])),
+            "duration": time.time() - session_data.created_at,
+            "silence_responses": 0,
+            "detailed_evaluation": detailed_evaluation,
+        }
+        
+        loop = asyncio.get_event_loop()
+        pdf_bytes = await loop.run_in_executor(
+            shared_clients.executor,
+            generate_comprehensive_pdf_report,
+            result, detailed_evaluation, session_data.session_id
+        )
+        
+        s3_url = upload_pdf_to_s3(
+            pdf_bytes=pdf_bytes,
+            session_id=session_data.session_id,
+            student_id=session_data.student_id,
+            report_type="daily_standup"
+        )
+        
+        update_standup_result_with_pdf_url(session_data.session_id, s3_url)
+        logger.info(f"📄 Auto PDF: generated + S3={'✅' if s3_url else '❌'} for {session_data.session_id}")
+        
+    except Exception as pdf_err:
+        logger.error(f"❌ Auto PDF generation failed: {pdf_err}")
+
 @app.post("/submit_feedback")
 async def submit_feedback(payload: FeedbackPayload):
     """
@@ -4222,20 +4719,9 @@ async def submit_feedback(payload: FeedbackPayload):
 async def get_feedback_stats():
     """Get aggregated feedback statistics from daily_standup_results collection."""
     try:
-        from pymongo import MongoClient
-        from urllib.parse import quote_plus
+        from core.mongo_pool import get_db  # ✅ Use shared pool
         
-        encoded_pass = quote_plus("LT@connect25")
-        connection_string = (
-            f"mongodb://connectly:{encoded_pass}"
-            f"@192.168.48.201:27017/ml_notes"
-            f"?authSource=admin"
-        )
-        
-        client = MongoClient(connection_string, serverSelectionTimeoutMS=10000)
-        db = client["ml_notes"]
-        
-        # ✅ CHANGED: Query from daily_standup_results with type filter
+        db = get_db()
         collection = db["daily_standup_results"]
         
         # Aggregate statistics - filter by type="session_feedback"
@@ -4290,10 +4776,8 @@ async def get_feedback_stats():
                 for item in common_issues
             ]
             
-            client.close()
             return stats
-        
-        client.close()
+     
         return {
             "total_feedback": 0,
             "message": "No feedback data available yet"
@@ -4314,20 +4798,9 @@ async def get_feedback_stats():
 async def get_session_feedback(session_id: str):
     """Get feedback for a specific session from daily_standup_results collection."""
     try:
-        from pymongo import MongoClient
-        from urllib.parse import quote_plus
+        from core.mongo_pool import get_db
         
-        encoded_pass = quote_plus("LT@connect25")
-        connection_string = (
-            f"mongodb://connectly:{encoded_pass}"
-            f"@192.168.48.201:27017/ml_notes"
-            f"?authSource=admin"
-        )
-        
-        client = MongoClient(connection_string, serverSelectionTimeoutMS=10000)
-        db = client["ml_notes"]
-        
-        # ✅ CHANGED: Query from daily_standup_results with type filter
+        db = get_db()
         collection = db["daily_standup_results"]
         
         # Find feedback document for this session
@@ -4336,7 +4809,6 @@ async def get_session_feedback(session_id: str):
             "type": "session_feedback"  # ✅ Filter by type
         })
         
-        client.close()
         
         if feedback:
             # Convert ObjectId to string
@@ -4364,24 +4836,14 @@ async def get_all_session_documents(session_id: str):
     Returns conversation (qa_session), evaluation (session_result), and feedback (session_feedback).
     """
     try:
-        from pymongo import MongoClient
-        from urllib.parse import quote_plus
+        from core.mongo_pool import get_db  # ✅ Use shared pool
         
-        encoded_pass = quote_plus("LT@connect25")
-        connection_string = (
-            f"mongodb://connectly:{encoded_pass}"
-            f"@192.168.48.201:27017/ml_notes"
-            f"?authSource=admin"
-        )
-        
-        client = MongoClient(connection_string, serverSelectionTimeoutMS=10000)
-        db = client["ml_notes"]
+        db = get_db()
         collection = db["daily_standup_results"]
         
         # Find all documents for this session
         documents = list(collection.find({"session_id": session_id}))
-        
-        client.close()
+
         
         if not documents:
             raise HTTPException(
@@ -4422,7 +4884,7 @@ async def get_all_session_documents(session_id: str):
 
 @app.get("/download_results/{session_id}")
 async def download_results_fast(session_id: str):
-    """Generate comprehensive PDF evaluation report."""
+    """Generate comprehensive PDF evaluation report, upload to S3, store URL in MongoDB."""
     try:
         result = await session_manager.get_session_result_fast(session_id)
         if not result:
@@ -4434,8 +4896,8 @@ async def download_results_fast(session_id: str):
         if not detailed_evaluation:
             # Generate basic evaluation structure from result data
             detailed_evaluation = {
-                "overall_score": result.get("score", 50),  # Convert 0-10 to 0-100
-                "technical_score": result.get("score", 50) ,
+                "overall_score": result.get("score", 50),
+                "technical_score": result.get("score", 50),
                 "communication_score": 70,
                 "attentiveness_score": 70,
                 "grade": get_grade_from_score(result.get("score", 5) * 10),
@@ -4470,14 +4932,31 @@ async def download_results_fast(session_id: str):
         
         # Generate comprehensive PDF
         loop = asyncio.get_event_loop()
-        pdf_buffer = await loop.run_in_executor(
+        pdf_bytes = await loop.run_in_executor(
             shared_clients.executor,
             generate_comprehensive_pdf_report,
             result, detailed_evaluation, session_id
         )
 
+        # ════════════════════════════════════════════════════════════
+        # NEW: Upload to S3 and store URL in MongoDB
+        # ════════════════════════════════════════════════════════════
+        student_id = result.get("student_id", None)
+        
+        s3_url = upload_pdf_to_s3(
+            pdf_bytes=pdf_bytes,
+            session_id=session_id,
+            student_id=student_id,
+            report_type="daily_standup"
+        )
+        
+        if s3_url:
+            update_standup_result_with_pdf_url(session_id, s3_url)
+        else:
+            logger.warning(f"⚠️ S3 upload failed for session {session_id}, pdf_url not stored")
+
         return StreamingResponse(
-            io.BytesIO(pdf_buffer),
+            io.BytesIO(pdf_bytes),
             media_type="application/pdf",
             headers={"Content-Disposition": f"attachment; filename=standup_evaluation_{session_id}.pdf"}
         )
@@ -4709,42 +5188,27 @@ async def verify_face_endpoint(request: FaceVerificationRequest):
 
 @app.post("/auth/verify-face-strict")
 async def verify_face_strict_endpoint(request: FaceVerificationRequest):
-    """
-    Strict face verification that also detects any human presence using YOLO.
-    - Detects multiple persons even without visible faces
-    - Detects hands, shoulders, people in background
-    - More secure than face-only verification
-    
-    Use this for continuous verification during standup sessions.
-    """
-    from core.biometric_auth import get_biometric_service
-    
     service = get_biometric_service()
     if service is None:
-        raise HTTPException(
-            status_code=503, 
-            detail="Biometric authentication service not available"
-        )
+        raise HTTPException(status_code=503, detail="...")
+    
+    # NEW: Validate that student_code matches the session owner
+    if hasattr(request, 'session_id') and request.session_id:
+        session_data = session_manager.active_sessions.get(request.session_id)
+        if session_data and str(session_data.student_id) != str(request.student_code):
+            raise HTTPException(403, "Student code does not match session owner")
     
     try:
-        # Decode base64 image
         image_base64 = request.image_base64
-        
-        # Handle data URL format (data:image/jpeg;base64,...)
         if "," in image_base64:
             image_base64 = image_base64.split(",")[1]
+        image_data = base64.b64decode(image_base64)
         
-        try:
-            image_data = base64.b64decode(image_base64)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}")
-        
-        # Use enhanced verification with person detection
-        result = service.verify_face_with_person_detection(
+        result = service.verify_face(
             student_code=request.student_code,
             image_data=image_data
         )
-        
+    
         logger.info(
             f"🔐 Strict face verification for {request.student_code}: "
             f"verified={result['verified']}, person_count={result.get('person_count', 'N/A')}, "
@@ -4768,6 +5232,60 @@ async def verify_face_strict_endpoint(request: FaceVerificationRequest):
         logger.error(f"❌ Strict face verification error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/auth/verify-face-identity")
+async def verify_face_identity(request: FaceVerificationRequest):
+    """
+    Lightweight identity-only verification endpoint.
+    Uses InsightFace embedding comparison only — NO YOLO person/object detection.
+    
+    ~70-80% faster than /auth/verify-face-strict because it skips the
+    multi-strategy YOLO detection pass. Used by the frontend's ProctoringMonitor
+    for periodic server-side identity checks every 8 seconds during sessions.
+    
+    Client-side BlazeFace + COCO-SSD handles face presence, pose, and
+    prohibited object detection in the browser.
+    """
+    from core.biometric_auth import get_biometric_service
+    
+    service = get_biometric_service()
+    if service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Biometric authentication service not available"
+        )
+    
+    try:
+        # Decode base64 image
+        image_base64 = request.image_base64
+        
+        # Handle data URL format (data:image/jpeg;base64,...)
+        if "," in image_base64:
+            image_base64 = image_base64.split(",")[1]
+        
+        try:
+            image_data = base64.b64decode(image_base64)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}")
+        
+        # Use lightweight identity-only verification (no YOLO)
+        result = service.verify_face_identity_only(
+            student_code=request.student_code,
+            image_data=image_data
+        )
+        
+        logger.info(
+            f"🔐 Identity-only verification for {request.student_code}: "
+            f"verified={result['verified']}, similarity={result.get('similarity', 0)}, "
+            f"error_type={result.get('error_type')}"
+        )
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Identity verification endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 '''@app.post("/auth/verify-voice/{session_id}")
 async def verify_voice_endpoint(

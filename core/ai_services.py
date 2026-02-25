@@ -125,6 +125,8 @@ class DS_SessionData:
     websocket: Optional[Any] = field(default=None)
     summary_manager: Optional[Any] = field(default=None)
     clarification_attempts: int = 0
+    # ✅ FIX: Per-session lock prevents audio + silence from colliding
+    processing_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # Fragment-based attributes
     fragments: Dict[str, str] = field(default_factory=dict)
@@ -185,11 +187,17 @@ class DS_SummaryChunk:
 
 
 class DS_SharedClientManager:
-    """Daily-standup original (sync OpenAI + Groq, threadpool)"""
+    """Daily-standup: separate pools for STT and LLM to prevent mutual blocking"""
     def __init__(self):
         self._groq_client = None
         self._openai_client = None
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=config.THREAD_POOL_MAX_WORKERS)
+        # ✅ Two separate pools so STT never blocks LLM and vice versa
+        self._stt_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=10, thread_name_prefix="stt"
+        )
+        self._llm_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=10, thread_name_prefix="llm"
+        )
 
     @property
     def groq_client(self) -> Groq:
@@ -212,12 +220,25 @@ class DS_SharedClientManager:
         return self._openai_client
 
     @property
+    def stt_executor(self):
+        """Pool dedicated to speech-to-text (Groq) calls"""
+        return self._stt_executor
+
+    @property
+    def llm_executor(self):
+        """Pool dedicated to LLM (OpenAI) calls"""
+        return self._llm_executor
+
+    @property
     def executor(self):
-        return self._executor
+        """Backward-compatible alias — defaults to LLM pool"""
+        return self._llm_executor
 
     async def close_connections(self):
-        if self._executor:
-            self._executor.shutdown(wait=True)
+        if self._stt_executor:
+            self._stt_executor.shutdown(wait=False)
+        if self._llm_executor:
+            self._llm_executor.shutdown(wait=False)
         logger.info("[DS] AI client connections closed")
 
 
@@ -424,8 +445,9 @@ class DS_OptimizedAudioProcessor:
             if audio_size < 50:
                 raise Exception(f"Audio data too small ({audio_size} bytes)")
             loop = asyncio.get_event_loop()
+            # ✅ FIX: Use dedicated STT pool — never blocked by LLM calls
             return await loop.run_in_executor(
-                self.client_manager.executor, self._sync_transcribe, audio_data
+                self.client_manager.stt_executor, self._sync_transcribe, audio_data
             )
         except Exception as e:
             logger.error(f"[DS] Transcription error: {e}")
