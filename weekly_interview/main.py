@@ -7,6 +7,8 @@ Real-time WebSocket interview with adaptive difficulty and silence handling
 FIXED: Now properly triggers evaluation when HR round completes
 FIXED: Removed double add_exchange that caused question number skipping
 FIXED: Sends is_repeat flag to frontend for proper question tracking
+FIXED: PDF download proxied through backend (CORS fix)
+FIXED: Silence counters reset on valid response
 """
 
 import os
@@ -18,10 +20,11 @@ import json
 import base64
 from typing import Dict, Optional, Any
 import io
-
 from datetime import datetime
 from pathlib import Path
+from fastapi import Form 
 import boto3
+import httpx
 from botocore.exceptions import ClientError
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -41,6 +44,13 @@ from reportlab.platypus import (
 from reportlab.graphics.shapes import Drawing, Rect, String
 
 from core.config import config
+from core.biometric_auth import (
+    init_biometric_services,
+    get_biometric_service,
+    get_voice_tracker,
+    get_phone_tracker,
+    get_head_turn_tracker,
+)
 from core.database import DatabaseManager
 from core.ai_services import (
     wi_shared_clients as shared_clients,
@@ -49,12 +59,14 @@ from core.ai_services import (
     WI_EnhancedInterviewFragmentManager as EnhancedInterviewFragmentManager,
     WI_OptimizedAudioProcessor as OptimizedAudioProcessor,
     WI_OptimizedConversationManager as OptimizedConversationManager,
+    MAX_CONSECUTIVE_SILENCE,
 )
 from core.tts_processor import UnifiedTTSProcessor as UltraFastTTSProcessor
 from core.prompts import validate_prompts
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 # ─── S3 Client Setup ───
 def _get_s3_client():
@@ -104,6 +116,68 @@ def get_s3_presigned_url(s3_key: str, expires_in: int = 3600) -> Optional[str]:
         logger.error("Presigned URL failed: %s", e)
         return None
 
+
+# ===== FIX: Download PDF bytes from S3 (proxy, avoids CORS) =====
+def download_pdf_from_s3(s3_key: str) -> Optional[bytes]:
+    """Download PDF from S3 and return bytes. Used to proxy PDF through backend."""
+    if not s3_client or not s3_key:
+        return None
+    try:
+        response = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+        return response['Body'].read()
+    except Exception as e:
+        logger.error("S3 download failed: %s", e)
+        return None
+
+def _check_audio_has_speech(audio_data: bytes, min_rms_threshold: float = 0.015, min_speech_ratio: float = 0.15) -> bool:
+    """
+    Server-side speech detection gate. Returns True only if audio contains
+    meaningful speech energy. Blocks noise/silence from reaching embedding comparison.
+    
+    Uses ffmpeg to decode + numpy RMS analysis on 20ms frames.
+    Much more reliable than frontend spectral VAD for this purpose.
+    """
+    import subprocess
+    import numpy as np
+    
+    try:
+        # Decode audio to raw PCM using ffmpeg
+        process = subprocess.run(
+            ["ffmpeg", "-i", "pipe:0", "-f", "s16le", "-ac", "1", "-ar", "16000", "-loglevel", "quiet", "pipe:1"],
+            input=audio_data, capture_output=True, timeout=5
+        )
+        if process.returncode != 0 or len(process.stdout) < 3200:  # < 0.1s of audio
+            return False
+        
+        pcm = np.frombuffer(process.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+        
+        # Analyze in 20ms frames (320 samples at 16kHz)
+        frame_size = 320
+        num_frames = len(pcm) // frame_size
+        if num_frames < 5:
+            return False
+        
+        speech_frames = 0
+        for i in range(num_frames):
+            frame = pcm[i * frame_size : (i + 1) * frame_size]
+            rms = np.sqrt(np.mean(frame ** 2))
+            if rms > min_rms_threshold:
+                speech_frames += 1
+        
+        speech_ratio = speech_frames / num_frames
+        has_speech = speech_ratio >= min_speech_ratio
+        
+        logger.debug(
+            "Speech detection: %d/%d frames active (%.1f%%), threshold=%.1f%% → %s",
+            speech_frames, num_frames, speech_ratio * 100, min_speech_ratio * 100,
+            "SPEECH" if has_speech else "NOISE"
+        )
+        return has_speech
+        
+    except Exception as e:
+        logger.warning("_check_audio_has_speech error: %s", e)
+        return True  # On error, allow through (don't block legitimate checks)
+
 class UltraFastInterviewManager:
     def __init__(self):
         self.active_sessions: Dict[str, InterviewSession] = {}
@@ -115,18 +189,18 @@ class UltraFastInterviewManager:
         )
         self.conversation_manager = OptimizedConversationManager(shared_clients)
 
-    async def create_session_fast(self, websocket: Optional[Any] = None) -> InterviewSession:
+    async def create_session_fast(self, student_id: int, websocket: Optional[Any] = None) -> InterviewSession:
         session_id = str(uuid.uuid4())
         test_id = f"interview_{int(time.time())}"
         try:
-            logger.info("Creating interview session: %s", session_id)
+            logger.info("Creating interview session: %s for student_id=%d", session_id, student_id)
 
-            student_info_task = asyncio.create_task(self.db_manager.get_student_info_fast())
+            student_info_task = asyncio.create_task(self.db_manager.get_student_info_fast(student_id))
             summaries_task = asyncio.create_task(self.db_manager.get_recent_summaries_fast(
                 days=config.RECENT_SUMMARIES_DAYS,
                 limit=config.SUMMARIES_LIMIT,
             ))
-            student_id, first_name, last_name, session_key = await student_info_task
+            fetched_student_id, first_name, last_name, session_key = await student_info_task
             summaries = await summaries_task
 
             if not summaries or len(summaries) == 0:
@@ -142,7 +216,7 @@ class UltraFastInterviewManager:
             session_data = InterviewSession(
                 session_id=session_id,
                 test_id=test_id,
-                student_id=student_id,
+                student_id=fetched_student_id,
                 student_name=f"{first_name} {last_name}",
                 session_key=session_key,
                 created_at=time.time(),
@@ -159,8 +233,29 @@ class UltraFastInterviewManager:
             self.tts_processor.start_session(session_data.session_id)
             self.active_sessions[session_id] = session_data
 
+            # Initialize biometric trackers for this session
+            try:
+                student_code = str(student_id)  # used for biometric lookups
+                session_data.student_code = student_code
+                
+                v_tracker = get_voice_tracker()
+                p_tracker = get_phone_tracker()
+                h_tracker = get_head_turn_tracker()
+                
+                if v_tracker:
+                    v_tracker.start_session(session_id, student_code)
+                if p_tracker:
+                    p_tracker.start_session(session_id, student_code)
+                if h_tracker:
+                    h_tracker.start_session(session_id, student_code)
+                    
+                logger.info("✅ Biometric trackers initialized for session %s", session_id)
+            except Exception as bio_init_err:
+                logger.warning("⚠️ Biometric tracker init failed: %s", bio_init_err)
+
             logger.info("Interview session created: %s for %s", session_id, session_data.student_name)
             return session_data
+
         except Exception as e:
             logger.error("Failed to create interview session: %s", e)
             raise Exception(f"Session creation failed: {e}")
@@ -171,6 +266,21 @@ class UltraFastInterviewManager:
                 self.tts_processor.end_session(session_id)
             except Exception:
                 pass
+            
+            # Clean up biometric trackers
+            try:
+                v_tracker = get_voice_tracker()
+                p_tracker = get_phone_tracker()
+                h_tracker = get_head_turn_tracker()
+                if v_tracker:
+                    v_tracker.end_session(session_id)
+                if p_tracker:
+                    p_tracker.end_session(session_id)
+                if h_tracker:
+                    h_tracker.end_session(session_id)
+            except Exception:
+                pass
+            
             del self.active_sessions[session_id]
             logger.info("Removed session %s", session_id)
 
@@ -187,7 +297,14 @@ class UltraFastInterviewManager:
             if audio_size < 100:
                 raise Exception(f"Audio too small: {audio_size} bytes")
     
+            # ===== VOICE VERIFICATION =====
+            # Disabled here — now handled by real-time streaming via _handle_voice_check
+            # The live voice check runs every 3s during recording with proper
+            # consecutive-confirmation, alert/warning escalation, and cooldown logic.
+            voice_verified = True
+
             transcript, quality = await self.audio_processor.transcribe_audio_fast(audio_data)
+
             # === Bluetooth/Headphone disconnect handling ===
             if transcript == "__DEVICE_DISCONNECTED__":
                 logger.warning("Session %s: Audio device disconnected", session_id)
@@ -202,20 +319,24 @@ class UltraFastInterviewManager:
             if transcript == "__DEVICE_RECONNECTING__":
                 logger.info("Session %s: Waiting for device reconnection", session_id)
                 return
+
             logger.info("Session %s: transcript='%s' quality=%.2f", session_id, (transcript or "").strip()[:50], quality)
             
             if not transcript or len(transcript.strip()) < 2:
                 await self._handle_silence(session_data)
                 return
 
+            # ===== FIX: Do NOT reset consecutive_no_response here =====
+            # ai_services.generate_fast_response will reset it only after
+            # confirming the response is actually meaningful (accuracy > 0).
+            # Resetting here allowed garbage transcripts (0% accuracy) to 
+            # break the silence streak, preventing auto-skip from ever firing.
+            session_data.silence_prompt_count = 0
+
             if session_data.exchanges:
                 answer_quality = self.conversation_manager._assess_answer_quality(transcript)
                 session_data.update_last_response(transcript, quality, answer_quality)
 
-            # =========================================================================
-            # FIXED: Track question count BEFORE generating response to detect if
-            # generate_fast_response internally added an exchange
-            # =========================================================================
             exchange_count_before = len(session_data.exchanges)
             stage_before = session_data.current_stage
 
@@ -226,7 +347,6 @@ class UltraFastInterviewManager:
             if not ai_response:
                 raise Exception("AI response generation returned empty response")
 
-            # CHECK IF INTERVIEW IS COMPLETE AND TRIGGER EVALUATION
             if session_data.current_stage == InterviewStage.COMPLETE:
                 logger.info("Session %s: Interview COMPLETE - triggering evaluation", session_id)
                 
@@ -255,37 +375,32 @@ class UltraFastInterviewManager:
                 logger.info("Total processing time (with evaluation): %.2fs", time.time() - start_time)
                 return
 
-            # =========================================================================
-            # FIXED Issue 1 & 2: Only add exchange in main.py if generate_fast_response
-            # did NOT already add one internally.
-            # 
-            # generate_fast_response adds exchanges internally for:
-            #   - Technical round (all question types)
-            #   - HR round (all question types)
-            #   - Round transitions (comm->tech, tech->hr)
-            #
-            # generate_fast_response does NOT add exchanges for:
-            #   - Communication round (just returns string)
-            #   - Introduction round
-            #   - Silence responses (just returns encouragement string)
-            #   - Repeat responses
-            # =========================================================================
+            # ===== CRITICAL FIX: Send round_transition to frontend when stage changes =====
+            stage_after = session_data.current_stage
+            if stage_after != stage_before and stage_after != InterviewStage.COMPLETE:
+                logger.info("Session %s: ROUND TRANSITION %s -> %s — sending round_transition to frontend",
+                           session_id, stage_before.value, stage_after.value)
+                await self._send_quick_message(session_data, {
+                    "type": "round_transition",
+                    "from_stage": stage_before.value,
+                    "to_stage": stage_after.value,
+                    "text": f"Moving to {stage_after.value} round...",
+                })
+
             exchange_count_after = len(session_data.exchanges)
             already_added = exchange_count_after > exchange_count_before
             
-            if already_added:
-                # generate_fast_response already called add_exchange internally
-                # Do NOT add another exchange here
+            if getattr(session_data, 'last_was_repeat', False):
+                logger.info("Session %s: REPEAT request - skipping add_exchange (Q# preserved)", session_id)
+            elif already_added:
                 logger.info("Session %s: Exchange already added by generate_fast_response (before=%d, after=%d), skipping duplicate add_exchange",
                            session_id, exchange_count_before, exchange_count_after)
             else:
-                # generate_fast_response did NOT add an exchange (communication, introduction, silence, repeat)
-                # We need to add it here
                 concept = session_data.current_concept if session_data.current_concept else "general"
                 is_followup = self._determine_if_followup(ai_response)
                 answer_quality = session_data.last_answer_quality
                 session_data.add_exchange(ai_response, "", quality, concept, is_followup, answer_quality)
-                logger.info("Session %s: Added exchange from main.py (comm/intro/silence/repeat)", session_id)
+                logger.info("Session %s: Added exchange from main.py (comm/intro/silence)", session_id)
             
             await self._send_response_with_ultra_fast_audio(session_data, ai_response)
             logger.info("Total processing time: %.2fs", time.time() - start_time)
@@ -302,14 +417,107 @@ class UltraFastInterviewManager:
             raise Exception(f"Audio processing failed: {e}")
 
     async def _handle_silence(self, session_data: InterviewSession):
-        silence_response = await self.conversation_manager.generate_silence_response(session_data)
+        """Handle empty/silent audio with progressive prompts and auto-question generation."""
+        current_stage = session_data.current_stage
         
+        # Cooldown to prevent feedback loop
+        now = time.time()
+        last_silence_time = getattr(session_data, '_last_silence_prompt_time', 0)
+        if now - last_silence_time < 3.0:
+            logger.info("Session %s: silence cooldown active", session_data.session_id)
+            return
+        session_data._last_silence_prompt_time = now
+        
+        session_data.consecutive_no_response += 1
+        logger.info("Session %s: consecutive_no_response=%d/%d", 
+                   session_data.session_id, session_data.consecutive_no_response, MAX_CONSECUTIVE_SILENCE)
+        
+        # Auto-skip if too many consecutive silences
+        if session_data.consecutive_no_response >= MAX_CONSECUTIVE_SILENCE:
+            logger.info("Session %s: %d consecutive silences — auto-skipping", 
+                       session_data.session_id, session_data.consecutive_no_response)
+            
+            if current_stage == InterviewStage.COMMUNICATION:
+                session_data.start_round(InterviewStage.TECHNICAL)
+                q, keywords = await self.conversation_manager._generate_technical_question(session_data)
+                session_data.add_exchange(q, expected_keywords=keywords, question_type="technical")
+                new_response = f"Let's move on to the technical round. {q}"
+            elif current_stage == InterviewStage.TECHNICAL:
+                session_data.start_round(InterviewStage.HR)
+                q, keywords = await self.conversation_manager._generate_hr_question(session_data, self.db_manager)
+                if "hr_complete" in keywords:
+                    session_data.current_stage = InterviewStage.COMPLETE
+                    new_response = "Thank you! Great interview. Let me generate your detailed feedback..."
+                    await self._send_response_with_ultra_fast_audio(session_data, new_response)
+                    await self._finalize_session_fast(session_data)
+                    return
+                session_data.add_exchange(q, expected_keywords=keywords, question_type="hr")
+                new_response = f"Let's move on to HR questions. {q}"
+            elif current_stage == InterviewStage.HR:
+                session_data.current_stage = InterviewStage.COMPLETE
+                new_response = "Thank you! Great interview. Let me generate your detailed feedback..."
+                await self._send_response_with_ultra_fast_audio(session_data, new_response)
+                await self._finalize_session_fast(session_data)
+                return
+            else:
+                new_response = "Take your time, I'm here whenever you're ready."
+            
+            await self._send_response_with_ultra_fast_audio(session_data, new_response)
+            return
+        
+        # Use conversation patterns for progressive silence
+        from core.conversation_patterns import get_response_for_quality
+        
+        silence_response, action_type = get_response_for_quality(
+            quality="silence",
+            stage=current_stage.value,
+            tracker=session_data.conversation_tracker,
+            silence_count=session_data.silence_prompt_count,
+        )
+        
+        # Auto-generate new question after 3rd silence prompt
+        if action_type == "generate_next":
+            session_data.silence_prompt_count = 0
+            logger.info("Session %s: 3rd silence — generating new question", session_data.session_id)
+            
+            try:
+                if current_stage == InterviewStage.TECHNICAL:
+                    q, keywords = await self.conversation_manager._generate_technical_question(session_data, "", True)
+                    session_data.add_exchange(q, expected_keywords=keywords, question_type="technical")
+                    new_response = f"{silence_response} {q}"
+                elif current_stage == InterviewStage.HR:
+                    q, keywords = await self.conversation_manager._generate_hr_question(session_data, self.db_manager)
+                    if "hr_complete" in keywords:
+                        session_data.current_stage = InterviewStage.COMPLETE
+                        new_response = "Thank you! Great interview. Let me generate your detailed feedback..."
+                        await self._send_response_with_ultra_fast_audio(session_data, new_response)
+                        await self._finalize_session_fast(session_data)
+                        return
+                    session_data.add_exchange(q, expected_keywords=keywords, question_type="hr")
+                    new_response = f"{silence_response} {q}"
+                elif current_stage == InterviewStage.COMMUNICATION:
+                    q = await self.conversation_manager._generate_communication_question(session_data)
+                    session_data.add_exchange(q, question_type="communication")
+                    new_response = f"{silence_response} {q}"
+                else:
+                    new_response = silence_response
+                
+                await self._send_response_with_ultra_fast_audio(session_data, new_response)
+                return
+            except Exception as e:
+                logger.error("Failed to generate question after silence: %s", e)
+        
+        # Increment silence counter AFTER getting response (prevents double increment)
+        session_data.silence_prompt_count += 1
+        
+        # Send silence prompt
         await self._send_quick_message(session_data, {
             "type": "silence_prompt",
             "text": silence_response,
             "stage": session_data.current_stage.value,
         })
         
+        # Stream TTS
         try:
             async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
                 silence_response, session_id=session_data.session_id
@@ -323,7 +531,7 @@ class UltraFastInterviewManager:
             await self._send_quick_message(session_data, {"type": "audio_end", "status": "silence_prompt"})
         except Exception as e:
             logger.warning("TTS error for silence prompt: %s", e)
-
+            
     def _determine_if_followup(self, ai_response: str) -> bool:
         indicators = ["elaborate", "can you explain", "tell me more", "what about",
                       "how did you", "could you describe", "follow up", "specifically"]
@@ -339,11 +547,41 @@ class UltraFastInterviewManager:
                 "status": "evaluating"
             })
             
-            evaluation, scores = await self.conversation_manager.generate_fast_evaluation(session_data)
+            evaluation, scores = None, None
+            for _eval_attempt in range(3):
+                try:
+                    evaluation, scores = await asyncio.wait_for(
+                        self.conversation_manager.generate_fast_evaluation(session_data),
+                        timeout=90.0,
+                    )
+                    if evaluation:
+                        break
+                except asyncio.TimeoutError:
+                    logger.warning("Evaluation attempt %d timed out for session %s", _eval_attempt + 1, session_data.session_id)
+                    await asyncio.sleep(2 ** _eval_attempt)
+                except Exception as eval_err:
+                    logger.error("Evaluation attempt %d failed: %s", _eval_attempt + 1, eval_err)
+                    await asyncio.sleep(2 ** _eval_attempt)
             if not evaluation:
-                raise Exception("Evaluation generation returned empty result")
-
-             # ── Generate PDF and upload to S3 ──
+                logger.error("All evaluation attempts failed — generating fallback scores")
+                evaluation = f"Evaluation could not be generated due to API timeouts.\n\nInterview completed with {len(session_data.exchanges)} exchanges."
+                tech_acc = session_data.correct_answers / max(session_data.correct_answers + session_data.partial_answers + session_data.wrong_answers, 1)
+                scores = {
+                    "communication_score": 5.0, "technical_score": round(tech_acc * 10, 1),
+                    "leadership_score": 5.0, "behaviour_score": 5.0, "confidence_score": 5.0,
+                    "weighted_overall": round(tech_acc * 10 * 0.3 + 5.0 * 0.7, 1),
+                    "technical_accuracy": round(tech_acc * 100, 1), "hr_accuracy": 50.0,
+                    "questions_correct": session_data.correct_answers,
+                    "questions_partial": session_data.partial_answers,
+                    "questions_wrong": session_data.wrong_answers,
+                    "questions_silent": 0, "total_questions": len(session_data.exchanges),
+                    "communication_questions": session_data.questions_per_round.get("communication", 0),
+                    "technical_questions": session_data.questions_per_round.get("technical", 0),
+                    "behavioral_in_technical_questions": 0,
+                    "technical_questions_total": session_data.questions_per_round.get("technical", 0),
+                    "hr_questions": session_data.questions_per_round.get("hr", 0),
+                }
+            # ── Generate PDF and upload to S3 ──
             pdf_url = None
             pdf_s3_key = None
             try:
@@ -373,25 +611,45 @@ class UltraFastInterviewManager:
             except Exception as pdf_err:
                 logger.error("PDF generation/upload failed: %s", pdf_err)
 
+            # Build conversation log grouped by round for easy frontend consumption
+            conversation_log_flat = [
+                {
+                    "timestamp": ex.timestamp,
+                    "stage": ex.stage.value,
+                    "ai_message": ex.ai_message,
+                    "user_response": ex.user_response,
+                    "transcript_quality": ex.transcript_quality,
+                    "concept": ex.concept,
+                    "is_followup": ex.is_followup,
+                    "answer_quality": ex.answer_quality,
+                    "question_type": ex.question_type,
+                }
+                for ex in session_data.exchanges
+            ]
+            
+            # Pre-separate by round so frontend doesn't mix them
+            conversation_by_round = {"communication": [], "technical": [], "hr": []}
+            for entry in conversation_log_flat:
+                stage = entry.get("stage", "")
+                if stage in conversation_by_round:
+                    conversation_by_round[stage].append(entry)
+            
+            logger.info(
+                "Session %s: Exchange distribution — communication=%d, technical=%d, hr=%d",
+                session_data.session_id,
+                len(conversation_by_round["communication"]),
+                len(conversation_by_round["technical"]),
+                len(conversation_by_round["hr"]),
+            )
+
             interview_data = {
                 "test_id": session_data.test_id,
                 "session_id": session_data.session_id,
                 "student_id": session_data.student_id,
                 "student_name": session_data.student_name,
                 "timestamp": time.time(),
-                "conversation_log": [
-                    {
-                        "timestamp": ex.timestamp,
-                        "stage": ex.stage.value,
-                        "ai_message": ex.ai_message,
-                        "user_response": ex.user_response,
-                        "transcript_quality": ex.transcript_quality,
-                        "concept": ex.concept,
-                        "is_followup": ex.is_followup,
-                        "answer_quality": ex.answer_quality,
-                    }
-                    for ex in session_data.exchanges
-                ],
+                "conversation_log": conversation_log_flat,
+                "conversation_by_round": conversation_by_round,
                 "evaluation": evaluation,
                 "scores": scores,
                 "duration_minutes": round((time.time() - session_data.created_at) / 60, 1),
@@ -415,6 +673,8 @@ class UltraFastInterviewManager:
                 "text": completion_message,
                 "evaluation": evaluation,
                 "scores": scores,
+                "conversation_by_round": conversation_by_round,
+                "questions_per_round": dict(session_data.questions_per_round),
                 "pdf_url": pdf_url or f"/weekly_interview/download_results/{session_data.test_id}",
                 "status": "complete",
             })
@@ -445,10 +705,6 @@ class UltraFastInterviewManager:
             fragment_manager = session_data.fragment_manager
             time_remaining = fragment_manager.get_round_time_remaining() if fragment_manager else 0
             
-            # =========================================================================
-            # FIXED Issue 1 & 3: Send is_repeat flag and proper question_number
-            # so frontend can track questions correctly and not echo user response
-            # =========================================================================
             await self._send_quick_message(session_data, {
                 "type": "ai_response",
                 "text": text,
@@ -477,6 +733,260 @@ class UltraFastInterviewManager:
                 logger.warning("TTS streaming failed: %s", tts_error)
         except Exception as e:
             logger.error("Audio streaming error: %s", e)
+
+    async def _handle_proctoring_frame(self, session_data: InterviewSession, image_data: bytes):
+        """Process a camera frame for phone detection + head turn detection"""
+        session_id = session_data.session_id
+        
+        try:
+            bio_service = get_biometric_service()
+            if not bio_service:
+                return
+            
+            # Run lightweight proctoring check (phone + head turn only)
+            phone_conf = getattr(config, 'PHONE_DETECTION_CONFIDENCE', 0.40)
+            yaw_threshold = getattr(config, 'HEAD_TURN_YAW_THRESHOLD', 35.0)
+            
+            proctor_result = await asyncio.get_event_loop().run_in_executor(
+                shared_clients.executor,
+                bio_service.quick_proctoring_check, image_data, phone_conf, yaw_threshold
+            )
+            
+            if proctor_result.get("error"):
+                logger.warning("Proctoring check error: %s", proctor_result["error"])
+                return
+            
+            # ===== Phone violation =====
+            if proctor_result["phone_detected"]:
+                p_tracker = get_phone_tracker()
+                if p_tracker:
+                    tracker_result = p_tracker.record_violation(
+                        session_id, proctor_result["phone_confidence"]
+                    )
+                    
+                    if tracker_result.get("should_terminate"):
+                        logger.warning("🛑 Session %s: PHONE DETECTION TERMINATED", session_id)
+                        await self._send_quick_message(session_data, {
+                            "type": "session_terminated",
+                            "reason": "phone_detected",
+                            "message": tracker_result["message"],
+                        })
+                        session_data.is_active = False
+                        return
+                    
+                    await self._send_quick_message(session_data, {
+                        "type": "verification_warning",
+                        "violation": "phone",
+                        "warning_count": tracker_result["warning_count"],
+                        "message": tracker_result["message"],
+                    })
+            
+            # ===== Head turn violation =====
+            if proctor_result["head_turned"]:
+                h_tracker = get_head_turn_tracker()
+                if h_tracker:
+                    tracker_result = h_tracker.record_violation(
+                        session_id, proctor_result["head_yaw"]
+                    )
+                    
+                    if tracker_result.get("should_terminate"):
+                        logger.warning("🛑 Session %s: HEAD TURN TERMINATED", session_id)
+                        await self._send_quick_message(session_data, {
+                            "type": "session_terminated",
+                            "reason": "head_turn",
+                            "message": tracker_result["message"],
+                        })
+                        session_data.is_active = False
+                        return
+                    
+                    await self._send_quick_message(session_data, {
+                        "type": "verification_warning",
+                        "violation": "head_turn",
+                        "warning_count": tracker_result["warning_count"],
+                        "message": tracker_result["message"],
+                    })
+            
+            # If no violations, send all-clear (optional, frontend can use this)
+            if not proctor_result["violations"]:
+                await self._send_quick_message(session_data, {
+                    "type": "proctoring_ok",
+                    "face_detected": proctor_result["face_detected"],
+                })
+                
+        except Exception as e:
+            logger.error("Proctoring frame handler error: %s", e)
+
+    async def _handle_voice_check(self, session_data: InterviewSession, audio_data: bytes, client_timestamp: int = 0):
+        """
+        Real-time voice identity check with controlled alert/warning/cooldown logic.
+        
+        Rules:
+        - Skip verification for first 1.5s of session speech
+        - Require 2 consecutive mismatch windows to count as 1 Alert
+        - 2 Alerts = 1 Warning
+        - 3 Warnings (6 Alerts) = Terminate
+        - 5-second cooldown after each Alert
+        """
+        session_id = session_data.session_id
+        try:
+            if not session_data.is_active:
+                return
+            if len(audio_data) < getattr(config, 'VOICE_MIN_AUDIO_BYTES', 16000):
+                return
+
+            bio_service = get_biometric_service()
+            v_tracker = get_voice_tracker()
+            student_code = getattr(session_data, 'student_code', str(session_data.student_id))
+
+            if not bio_service or not v_tracker:
+                return
+            if not getattr(config, 'VOICE_VERIFY_ENABLED', True):
+                return
+
+            now = time.time()
+
+            # ===== INIT per-session voice check state (once) =====
+            if not hasattr(session_data, '_vc_state'):
+                session_data._vc_state = {
+                    "first_speech_time": None,     # when first valid speech was detected
+                    "consecutive_mismatches": 0,   # consecutive mismatch windows (need 2 for 1 alert)
+                    "alert_count": 0,              # alerts (2 alerts = 1 warning)
+                    "warning_count": 0,            # warnings (3 = terminate)
+                    "last_alert_time": 0,          # for cooldown
+                    "total_checks": 0,             # total checks performed
+                }
+            vc = session_data._vc_state
+
+            # ===== ROUND START PROTECTION: skip first 1.5s =====
+            if vc["first_speech_time"] is None:
+                vc["first_speech_time"] = now
+                logger.info("🎤 Voice check: first speech detected for session %s, starting 1.5s grace", session_id)
+                return
+            
+            if now - vc["first_speech_time"] < 1.5:
+                return
+
+            # ===== COOLDOWN: 5 seconds after last alert =====
+            if now - vc["last_alert_time"] < 5.0:
+                return
+
+            vc["total_checks"] += 1
+
+            # ===== SERVER-SIDE SPEECH DETECTION GATE =====
+            # Check if audio actually contains speech before running expensive embedding comparison.
+            # Uses energy-based check on raw audio — noise has low RMS energy in speech band.
+            try:
+                has_speech = await asyncio.get_event_loop().run_in_executor(
+                    shared_clients.executor,
+                    _check_audio_has_speech, audio_data
+                )
+                if not has_speech:
+                    logger.info("🔇 Voice check SKIPPED — server-side speech detection says NO SPEECH")
+                    vc["consecutive_mismatches"] = 0
+                    return
+            except Exception as speech_check_err:
+                logger.warning("Speech detection check failed (continuing anyway): %s", speech_check_err)
+
+            # ===== RUN VERIFICATION =====
+            voice_result = await asyncio.get_event_loop().run_in_executor(
+                shared_clients.executor,
+                bio_service.verify_voice, student_code, audio_data, "webm"
+            )
+
+            # Technical extraction error — skip silently
+            if voice_result.get("skip_warning") or voice_result.get("is_extraction_error"):
+                vc["consecutive_mismatches"] = 0  # reset streak on error
+                return
+
+            similarity = voice_result.get("similarity", 0.0)
+
+            # ===== NOISE GATE: Ultra-low similarity = noise, not a person =====
+            # Real human impostor scores 0.15-0.45. Noise/silence scores 0.0-0.12.
+            noise_similarity_floor = 0.12
+            if similarity < noise_similarity_floor:
+                logger.info(
+                    "🔇 Voice check SKIPPED — similarity %.4f < noise floor %.2f (likely noise, not speech)",
+                    similarity, noise_similarity_floor
+                )
+                vc["consecutive_mismatches"] = 0  # Don't let noise build mismatch streak
+                return
+
+            # ===== VOICE MATCHED — reset mismatch streak =====
+            if voice_result.get("verified", True):
+                vc["consecutive_mismatches"] = 0
+                return
+
+            # ===== MISMATCH DETECTED — need 2 consecutive to count as 1 Alert =====
+            vc["consecutive_mismatches"] += 1
+            logger.info(
+                "🔶 Voice mismatch window %d/2 for session %s (similarity=%.4f)",
+                vc["consecutive_mismatches"], session_id, similarity
+            )
+
+            if vc["consecutive_mismatches"] < 2:
+                # First mismatch — wait for confirmation in next window
+                return
+
+            # ===== CONFIRMED ALERT (2 consecutive mismatches) =====
+            vc["consecutive_mismatches"] = 0  # reset streak
+            vc["alert_count"] += 1
+            vc["last_alert_time"] = now
+
+            logger.warning(
+                "🔴 VOICE ALERT #%d for session %s (similarity=%.4f)",
+                vc["alert_count"], session_id, similarity
+            )
+
+            # ===== CHECK IF 2 ALERTS = 1 WARNING =====
+            if vc["alert_count"] >= 2:
+                vc["alert_count"] = 0  # reset alert counter
+                vc["warning_count"] += 1
+
+                max_warnings = 3
+
+                logger.warning(
+                    "⚠️ VOICE WARNING %d/%d for session %s",
+                    vc["warning_count"], max_warnings, session_id
+                )
+
+                should_terminate = vc["warning_count"] >= max_warnings
+
+                # Record in tracker for consistency with existing system
+                v_tracker.record_verification(
+                    session_id, verified=False, similarity=similarity, skip_warning=False
+                )
+
+                await self._send_quick_message(session_data, {
+                    "type": "voice_mismatch",
+                    "message": f"Voice Mismatch Warning {vc['warning_count']}/{max_warnings} (similarity: {similarity:.2f})",
+                    "similarity": similarity,
+                    "threshold": voice_result.get("threshold", 0.45),
+                    "warning_count": vc["warning_count"],
+                    "max_warnings": max_warnings,
+                    "should_terminate": should_terminate,
+                    "timestamp": client_timestamp,
+                })
+
+                if should_terminate:
+                    logger.warning("🛑 Session %s TERMINATED: %d voice warnings", session_id, vc["warning_count"])
+                    await self._send_quick_message(session_data, {
+                        "type": "session_terminated",
+                        "reason": "voice_mismatch",
+                        "message": f"Session terminated: Voice identity verification failed ({vc['warning_count']} warnings from {vc['warning_count'] * 2} alerts)",
+                    })
+                    session_data.is_active = False
+            else:
+                # First alert of pair — notify frontend as minor alert (not a warning yet)
+                await self._send_quick_message(session_data, {
+                    "type": "voice_alert",
+                    "message": f"Voice alert detected (similarity: {similarity:.2f}) — {2 - vc['alert_count']} more alert before warning",
+                    "similarity": similarity,
+                    "alert_count": vc["alert_count"],
+                    "warning_count": vc["warning_count"],
+                })
+
+        except Exception as e:
+            logger.warning("Live voice check error (non-fatal): %s", e)
 
     async def _send_quick_message(self, session_data: InterviewSession, message: dict):
         try:
@@ -519,6 +1029,18 @@ async def startup_event():
         conn = db_manager.get_mysql_connection()
         conn.close()
         await db_manager.get_mongo_client()
+        
+        # Initialize biometric services for proctoring
+        try:
+            init_biometric_services(
+                max_voice_warnings=getattr(config, 'VOICE_MAX_WARNINGS', 3),
+                max_phone_warnings=getattr(config, 'PHONE_MAX_WARNINGS', 3),
+                max_head_turn_warnings=getattr(config, 'HEAD_TURN_MAX_WARNINGS', 3),
+            )
+            logger.info("✅ Biometric proctoring services initialized")
+        except Exception as bio_err:
+            logger.warning("⚠️ Biometric services failed to init (proctoring disabled): %s", bio_err)
+        
         logger.info("All systems ready")
     except Exception as e:
         logger.error("Startup failed: %s", e)
@@ -529,10 +1051,57 @@ async def shutdown_event():
     await shared_clients.close_connections()
     await interview_manager.db_manager.close_connections()
 
-@app.get("/start_interview")
-async def start_interview_session():
+@app.post("/verify_face_gate")
+async def verify_face_before_interview(student_id: int = Form(None), image_base64: str = Form(None)):
+    """
+    Pre-interview face verification gate.
+    Frontend sends student_id + camera frame (base64).
+    Returns pass/fail. Student cannot start interview without passing.
+    """
     try:
-        session_data = await interview_manager.create_session_fast()
+        if not student_id:
+            raise HTTPException(status_code=400, detail="student_id is required")
+        if not image_base64:
+            raise HTTPException(status_code=400, detail="image_base64 is required")
+        
+        bio_service = get_biometric_service()
+        if not bio_service:
+            # If biometric service is unavailable, allow entry with warning
+            logger.warning("⚠️ Biometric service unavailable - allowing entry without face check")
+            return {"verified": True, "warning": "Face verification unavailable", "can_proceed": True}
+        
+        # Decode image
+        if 'base64,' in image_base64:
+            image_base64 = image_base64.split('base64,')[1]
+        image_data = base64.b64decode(image_base64)
+        
+        # Verify face against stored embedding
+        student_code = str(student_id)
+        result = await asyncio.get_event_loop().run_in_executor(
+            shared_clients.executor,
+            bio_service.verify_face_with_person_detection, student_code, image_data
+        )
+        
+        return {
+            "verified": result.get("verified", False),
+            "similarity": result.get("similarity", 0.0),
+            "error": result.get("error"),
+            "error_type": result.get("error_type"),
+            "can_proceed": result.get("can_proceed", False),
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Face gate verification error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+        
+@app.get("/start_interview")
+async def start_interview_session(student_id: int = None):
+    try:
+        if not student_id:
+            raise HTTPException(status_code=400, detail="student_id is required. Pass ?student_id=<ID> from the logged-in session.")
+        session_data = await interview_manager.create_session_fast(student_id=student_id)
         first_question = await interview_manager.conversation_manager.generate_first_question(session_data)
         session_data.add_exchange(first_question, "", 0.0, "introduction", False)
         if session_data.fragment_manager:
@@ -561,25 +1130,100 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             return
 
         session_data.websocket = websocket
+
+        # Tell frontend we're loading models (show "Preparing AI..." screen)
+        await websocket.send_text(json.dumps({
+            "type": "model_loading",
+            "status": "loading",
+            "message": "Loading AI models, please wait..."
+        }))
+
+        # Pre-warm all lazy-loaded models BEFORE telling frontend we're ready
+        try:
+            logger.info("🔄 Pre-warming AI models for session %s...", session_id)
+            warm_start = time.time()
+
+            # 1. Warm up Groq/OpenAI clients
+            await shared_clients.initialize()
+
+            # 2. Warm up TTS processor (first synthesis is slow)
+            try:
+                async for _ in interview_manager.tts_processor.generate_ultra_fast_stream(
+                    "Ready.", session_id=session_id
+                ):
+                    pass  # Discard warmup audio
+            except Exception as tts_warm_err:
+                logger.warning("TTS warmup failed (non-fatal): %s", tts_warm_err)
+
+            # 3. Warm up audio transcription pipeline (Whisper model load)
+            try:
+                # Create a minimal valid WAV (0.5s silence at 16kHz)
+                import struct
+                num_samples = 8000  # 0.5s at 16kHz
+                wav_header = struct.pack(
+                    '<4sI4s4sIHHIIHH4sI',
+                    b'RIFF', 36 + num_samples * 2, b'WAVE',
+                    b'fmt ', 16, 1, 1, 16000, 32000, 2, 16,
+                    b'data', num_samples * 2
+                )
+                warmup_wav = wav_header + b'\x00\x00' * num_samples
+                await interview_manager.audio_processor.transcribe_audio_fast(warmup_wav)
+            except Exception as stt_warm_err:
+                logger.warning("STT warmup failed (non-fatal): %s", stt_warm_err)
+
+            # 4. Warm up biometric models if enabled
+            try:
+                bio_service = get_biometric_service()
+                if bio_service:
+                    _ = bio_service.face_analyzer  # Triggers InsightFace load
+                    _ = bio_service.voice_encoder  # Triggers SpeechBrain load
+            except Exception as bio_warm_err:
+                logger.warning("Biometric warmup failed (non-fatal): %s", bio_warm_err)
+
+            warm_elapsed = time.time() - warm_start
+            logger.info("✅ All models pre-warmed in %.1fs for session %s", warm_elapsed, session_id)
+        except Exception as warm_err:
+            logger.error("Model warmup error (continuing anyway): %s", warm_err)
+
+        # NOW tell the frontend everything is ready
+        await websocket.send_text(json.dumps({
+            "type": "model_ready",
+            "status": "ready",
+            "message": "AI model loaded and session ready"
+        }))
         
         if session_data.exchanges:
             first_question = session_data.exchanges[0].ai_message
+
+            # Pre-buffer ALL TTS audio chunks BEFORE sending ai_response
+            # This prevents the frontend timer from starting while TTS is still generating
+            logger.info("🔊 Pre-generating TTS for first question (session %s)...", session_id)
+            tts_start = time.time()
+            pre_buffered_chunks = []
+            try:
+                async for audio_chunk in interview_manager.tts_processor.generate_ultra_fast_stream(
+                    first_question, session_id=session_id
+                ):
+                    if audio_chunk:
+                        pre_buffered_chunks.append(audio_chunk)
+            except Exception as tts_err:
+                logger.warning("TTS pre-buffer failed: %s", tts_err)
+            logger.info("🔊 TTS pre-buffered %d chunks in %.1fs", len(pre_buffered_chunks), time.time() - tts_start)
+
+            # NOW send ai_response + audio in rapid succession (no generation delay)
             await websocket.send_text(json.dumps({
                 "type": "ai_response",
                 "text": first_question,
                 "stage": "introduction",
             }))
-            
-            async for audio_chunk in interview_manager.tts_processor.generate_ultra_fast_stream(
-                first_question, session_id=session_id
-            ):
-                if audio_chunk:
-                    await websocket.send_text(json.dumps({
-                        "type": "audio_chunk",
-                        "audio": audio_chunk.hex(),
-                    }))
-            await websocket.send_text(json.dumps({"type": "audio_end"}))
 
+            for chunk in pre_buffered_chunks:
+                await websocket.send_text(json.dumps({
+                    "type": "audio_chunk",
+                    "audio": chunk.hex(),
+                }))
+            await websocket.send_text(json.dumps({"type": "audio_end"}))
+            
         while session_data.is_active and session_data.current_stage != InterviewStage.COMPLETE:
             try:
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=config.WEBSOCKET_TIMEOUT)
@@ -598,7 +1242,30 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     
                     if session_data.current_stage == InterviewStage.COMPLETE:
                         break
+
+                elif message.get("type") == "face_frame":
+                    # Periodic camera frame for proctoring (phone + head turn)
+                    frame_b64 = message.get("image", "")
+                    if frame_b64:
+                        try:
+                            frame_data = base64.b64decode(frame_b64)
+                            await interview_manager._handle_proctoring_frame(session_data, frame_data)
+                            # Check if session was terminated by proctoring
+                            if not session_data.is_active:
+                                break
+                        except Exception as frame_err:
+                            logger.warning("Proctoring frame error: %s", frame_err)
                         
+                elif message.get("type") == "voice_check":
+                    # Real-time voice identity check (streaming, every ~3s)
+                    vc_audio_b64 = message.get("audio", "")
+                    if vc_audio_b64:
+                        asyncio.create_task(
+                            interview_manager._handle_voice_check(
+                                session_data, base64.b64decode(vc_audio_b64), message.get("timestamp", 0)
+                            )
+                        )
+
                 elif message.get("type") == "ping":
                     await websocket.send_text(json.dumps({"type": "pong"}))
                     
@@ -606,7 +1273,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     session_data.is_active = False
                     break
 
-                # === Bluetooth/Headphone device change handlers ===
                 elif message.get("type") == "device_change":
                     device_info = message.get("device", {})
                     logger.info("Audio device changed for session %s: %s", session_id, device_info)
@@ -625,7 +1291,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         "text": "Device reconnected. You can continue your interview.",
                         "interview_continues": True
                     }))
-                    
+
             except asyncio.TimeoutError:
                 break
             except WebSocketDisconnect:
@@ -647,17 +1313,32 @@ async def websocket_endpoint_alias(websocket: WebSocket, session_id: str):
 async def health_check():
     return {"status": "healthy", "active_sessions": len(interview_manager.active_sessions)}
 
+
+# ===== FIX: PDF download — proxy through backend to avoid CORS =====
+# Old code used RedirectResponse to S3 presigned URL, which caused:
+#   "blocked by CORS policy: No 'Access-Control-Allow-Origin' header"
+# New code downloads from S3 and streams directly to the browser.
 @app.get("/download_results/{test_id}")
 async def download_results(test_id: str):
     try:
         result = await interview_manager.get_session_result_fast(test_id)
 
-        # Try S3 presigned URL first
+        # ===== FIX: Proxy PDF through backend (no CORS redirect to S3) =====
         pdf_s3_key = result.get("pdf_s3_key")
-        if pdf_s3_key:
-            presigned_url = get_s3_presigned_url(pdf_s3_key, expires_in=3600)
-            if presigned_url:
-                return RedirectResponse(url=presigned_url)
+        if pdf_s3_key and s3_client:
+            try:
+                s3_response = s3_client.get_object(Bucket=S3_BUCKET, Key=pdf_s3_key)
+                pdf_bytes = s3_response["Body"].read()
+                return StreamingResponse(
+                    io.BytesIO(pdf_bytes),
+                    media_type="application/pdf",
+                    headers={
+                        "Content-Disposition": f"inline; filename=interview_report_{test_id}.pdf",
+                        "Cache-Control": "public, max-age=3600",
+                    },
+                )
+            except Exception as s3_err:
+                logger.warning("S3 fetch failed, generating on-the-fly: %s", s3_err)
 
         # Fallback: generate on-the-fly
         pdf_buffer = await asyncio.get_event_loop().run_in_executor(
@@ -666,24 +1347,21 @@ async def download_results(test_id: str):
         return StreamingResponse(
             io.BytesIO(pdf_buffer),
             media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename=interview_report_{test_id}.pdf"},
+            headers={"Content-Disposition": f"inline; filename=interview_report_{test_id}.pdf"},
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
     
 def generate_pdf_report(result: dict, test_id: str) -> bytes:
     """
     Professional Interview Evaluation Report PDF Generator.
-    
-    Replaces the old ~15 line plain-text version.
-    Same signature, same return type (bytes), drop-in replacement.
     """
     import io
     from datetime import datetime
     
     pdf_buffer = io.BytesIO()
     
-    # ── Page Setup ──────────────────────────────────────────────────────────
     doc = SimpleDocTemplate(
         pdf_buffer,
         pagesize=A4,
@@ -693,76 +1371,32 @@ def generate_pdf_report(result: dict, test_id: str) -> bytes:
         bottomMargin=15*mm,
     )
     
-    # ── Color Palette ───────────────────────────────────────────────────────
-    PRIMARY      = HexColor("#1a237e")   # Deep indigo
-    PRIMARY_LIGHT = HexColor("#e8eaf6")  # Light indigo bg
-    ACCENT       = HexColor("#0d47a1")   # Blue
-    SUCCESS      = HexColor("#2e7d32")   # Green
-    WARNING      = HexColor("#f57f17")   # Amber
-    DANGER       = HexColor("#c62828")   # Red
-    NEUTRAL      = HexColor("#546e7a")   # Blue-grey
-    LIGHT_BG     = HexColor("#f5f5f5")   # Light grey
-    DARK_TEXT     = HexColor("#212121")   # Near black
-    MED_TEXT      = HexColor("#616161")   # Medium grey
+    PRIMARY      = HexColor("#1a237e")
+    PRIMARY_LIGHT = HexColor("#e8eaf6")
+    ACCENT       = HexColor("#0d47a1")
+    SUCCESS      = HexColor("#2e7d32")
+    WARNING      = HexColor("#f57f17")
+    DANGER       = HexColor("#c62828")
+    NEUTRAL      = HexColor("#546e7a")
+    LIGHT_BG     = HexColor("#f5f5f5")
+    DARK_TEXT     = HexColor("#212121")
+    MED_TEXT      = HexColor("#616161")
     
-    # ── Custom Styles ───────────────────────────────────────────────────────
     styles = getSampleStyleSheet()
     
-    styles.add(ParagraphStyle(
-        'ReportTitle', parent=styles['Title'],
-        fontName='Helvetica-Bold', fontSize=22, textColor=white,
-        spaceAfter=6, alignment=TA_LEFT
-    ))
-    styles.add(ParagraphStyle(
-        'ReportSubtitle', parent=styles['Normal'],
-        fontName='Helvetica', fontSize=11, textColor=HexColor("#b0bec5"),
-        spaceAfter=2, alignment=TA_LEFT
-    ))
-    styles.add(ParagraphStyle(
-        'SectionHeading', parent=styles['Heading2'],
-        fontName='Helvetica-Bold', fontSize=14, textColor=PRIMARY,
-        spaceBefore=16, spaceAfter=8,
-        borderPadding=(0, 0, 4, 0),
-    ))
-    styles.add(ParagraphStyle(
-        'RoundHeading', parent=styles['Heading3'],
-        fontName='Helvetica-Bold', fontSize=12, textColor=white,
-        spaceBefore=12, spaceAfter=6,
-    ))
-    styles.add(ParagraphStyle(
-        'QText', parent=styles['Normal'],
-        fontName='Helvetica-Bold', fontSize=9.5, textColor=DARK_TEXT,
-        spaceBefore=2, spaceAfter=1, leading=13,
-    ))
-    styles.add(ParagraphStyle(
-        'AText', parent=styles['Normal'],
-        fontName='Helvetica', fontSize=9.5, textColor=MED_TEXT,
-        spaceBefore=1, spaceAfter=1, leading=13,
-    ))
-    styles.add(ParagraphStyle(
-        'FeedbackText', parent=styles['Normal'],
-        fontName='Helvetica-Oblique', fontSize=9, textColor=NEUTRAL,
-        spaceBefore=1, spaceAfter=4, leading=12,
-    ))
-    styles.add(ParagraphStyle(
-        'BodyText2', parent=styles['Normal'],
-        fontName='Helvetica', fontSize=10, textColor=DARK_TEXT,
-        spaceBefore=2, spaceAfter=2, leading=14, alignment=TA_JUSTIFY,
-    ))
-    styles.add(ParagraphStyle(
-        'SmallLabel', parent=styles['Normal'],
-        fontName='Helvetica', fontSize=8, textColor=MED_TEXT,
-        alignment=TA_CENTER,
-    ))
-    styles.add(ParagraphStyle(
-        'ScoreValue', parent=styles['Normal'],
-        fontName='Helvetica-Bold', fontSize=16, textColor=PRIMARY,
-        alignment=TA_CENTER,
-    ))
+    styles.add(ParagraphStyle('ReportTitle', parent=styles['Title'], fontName='Helvetica-Bold', fontSize=22, textColor=white, spaceAfter=6, alignment=TA_LEFT))
+    styles.add(ParagraphStyle('ReportSubtitle', parent=styles['Normal'], fontName='Helvetica', fontSize=11, textColor=HexColor("#b0bec5"), spaceAfter=2, alignment=TA_LEFT))
+    styles.add(ParagraphStyle('SectionHeading', parent=styles['Heading2'], fontName='Helvetica-Bold', fontSize=14, textColor=PRIMARY, spaceBefore=16, spaceAfter=8, borderPadding=(0, 0, 4, 0)))
+    styles.add(ParagraphStyle('RoundHeading', parent=styles['Heading3'], fontName='Helvetica-Bold', fontSize=12, textColor=white, spaceBefore=12, spaceAfter=6))
+    styles.add(ParagraphStyle('QText', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=9.5, textColor=DARK_TEXT, spaceBefore=2, spaceAfter=1, leading=13))
+    styles.add(ParagraphStyle('AText', parent=styles['Normal'], fontName='Helvetica', fontSize=9.5, textColor=MED_TEXT, spaceBefore=1, spaceAfter=1, leading=13))
+    styles.add(ParagraphStyle('FeedbackText', parent=styles['Normal'], fontName='Helvetica-Oblique', fontSize=9, textColor=NEUTRAL, spaceBefore=1, spaceAfter=4, leading=12))
+    styles.add(ParagraphStyle('BodyText2', parent=styles['Normal'], fontName='Helvetica', fontSize=10, textColor=DARK_TEXT, spaceBefore=2, spaceAfter=2, leading=14, alignment=TA_JUSTIFY))
+    styles.add(ParagraphStyle('SmallLabel', parent=styles['Normal'], fontName='Helvetica', fontSize=8, textColor=MED_TEXT, alignment=TA_CENTER))
+    styles.add(ParagraphStyle('ScoreValue', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=16, textColor=PRIMARY, alignment=TA_CENTER))
     
     story = []
     
-    # ── Extract Data ────────────────────────────────────────────────────────
     student_name = result.get("student_name", "Student")
     scores = result.get("scores", {})
     evaluation = result.get("evaluation", "")
@@ -778,43 +1412,25 @@ def generate_pdf_report(result: dict, test_id: str) -> bytes:
     
     overall_score = scores.get("weighted_overall", 5.0)
     
-    # Determine grade
-    if overall_score >= 8.5:
-        grade, grade_color = "Excellent", SUCCESS
-    elif overall_score >= 7.0:
-        grade, grade_color = "Good", HexColor("#1b5e20")
-    elif overall_score >= 5.5:
-        grade, grade_color = "Average", WARNING
-    elif overall_score >= 4.0:
-        grade, grade_color = "Needs Improvement", HexColor("#e65100")
-    else:
-        grade, grade_color = "Poor", DANGER
+    if overall_score >= 8.5: grade, grade_color = "Excellent", SUCCESS
+    elif overall_score >= 7.0: grade, grade_color = "Good", HexColor("#1b5e20")
+    elif overall_score >= 5.5: grade, grade_color = "Average", WARNING
+    elif overall_score >= 4.0: grade, grade_color = "Needs Improvement", HexColor("#e65100")
+    else: grade, grade_color = "Poor", DANGER
 
-    # ════════════════════════════════════════════════════════════════════════
-    # SECTION 1: HEADER BANNER
-    # ════════════════════════════════════════════════════════════════════════
     header_data = [[
         Paragraph(f"<b>{student_name}</b>", styles['ReportTitle']),
-        Paragraph(f"<b>{overall_score}/10</b>", ParagraphStyle(
-            'HeaderScore', parent=styles['Normal'],
-            fontName='Helvetica-Bold', fontSize=28, textColor=white,
-            alignment=TA_RIGHT,
-        ))
+        Paragraph(f"<b>{overall_score}/10</b>", ParagraphStyle('HeaderScore', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=28, textColor=white, alignment=TA_RIGHT))
     ]]
     header_table = Table(header_data, colWidths=[120*mm, 50*mm])
     header_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), PRIMARY),
-        ('TEXTCOLOR', (0, 0), (-1, -1), white),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('LEFTPADDING', (0, 0), (0, 0), 15),
-        ('RIGHTPADDING', (-1, -1), (-1, -1), 15),
-        ('TOPPADDING', (0, 0), (-1, -1), 12),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
-        ('ROUNDEDCORNERS', [6, 6, 0, 0]),
+        ('BACKGROUND', (0, 0), (-1, -1), PRIMARY), ('TEXTCOLOR', (0, 0), (-1, -1), white),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'), ('LEFTPADDING', (0, 0), (0, 0), 15),
+        ('RIGHTPADDING', (-1, -1), (-1, -1), 15), ('TOPPADDING', (0, 0), (-1, -1), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 12), ('ROUNDEDCORNERS', [6, 6, 0, 0]),
     ]))
     story.append(header_table)
     
-    # Sub-header with meta info
     meta_data = [[
         Paragraph(f"<b>Date:</b> {interview_date}", ParagraphStyle('Meta', fontName='Helvetica', fontSize=8.5, textColor=MED_TEXT)),
         Paragraph(f"<b>Duration:</b> {duration} min", ParagraphStyle('Meta2', fontName='Helvetica', fontSize=8.5, textColor=MED_TEXT)),
@@ -823,25 +1439,18 @@ def generate_pdf_report(result: dict, test_id: str) -> bytes:
     ]]
     meta_table = Table(meta_data, colWidths=[48*mm, 35*mm, 42*mm, 45*mm])
     meta_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), PRIMARY_LIGHT),
-        ('TOPPADDING', (0, 0), (-1, -1), 6),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-        ('LEFTPADDING', (0, 0), (0, 0), 15),
+        ('BACKGROUND', (0, 0), (-1, -1), PRIMARY_LIGHT), ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6), ('LEFTPADDING', (0, 0), (0, 0), 15),
         ('ROUNDEDCORNERS', [0, 0, 6, 6]),
     ]))
     story.append(meta_table)
     story.append(Spacer(1, 12))
     
-    # ════════════════════════════════════════════════════════════════════════
-    # SECTION 2: SCORE DASHBOARD
-    # ════════════════════════════════════════════════════════════════════════
     story.append(Paragraph("Score Dashboard", styles['SectionHeading']))
     
     score_keys = [
-        ("Communication", "communication_score", 0.20),
-        ("Technical", "technical_score", 0.30),
-        ("Leadership", "leadership_score", 0.15),
-        ("Behaviour", "behaviour_score", 0.20),
+        ("Communication", "communication_score", 0.20), ("Technical", "technical_score", 0.30),
+        ("Leadership", "leadership_score", 0.15), ("Behaviour", "behaviour_score", 0.20),
         ("Confidence", "confidence_score", 0.15),
     ]
     
@@ -852,46 +1461,27 @@ def generate_pdf_report(result: dict, test_id: str) -> bytes:
         return DANGER
     
     def _make_gauge_cell(label, score_val, weight_pct):
-        """Create a mini gauge bar for a score dimension"""
         sc = min(max(score_val, 0), 10)
         color = _score_color(sc)
-        bar_width = 100  # px
+        bar_width = 100
         filled = int(sc / 10 * bar_width)
-        
         d = Drawing(bar_width + 10, 14)
-        # Background bar
         d.add(Rect(0, 2, bar_width, 10, fillColor=HexColor("#e0e0e0"), strokeColor=None))
-        # Filled bar
-        if filled > 0:
-            d.add(Rect(0, 2, filled, 10, fillColor=color, strokeColor=None))
-        # Score text
+        if filled > 0: d.add(Rect(0, 2, filled, 10, fillColor=color, strokeColor=None))
         d.add(String(bar_width + 3, 3, f"{sc:.1f}", fontName='Helvetica-Bold', fontSize=9, fillColor=color))
-        
         return [
-            Paragraph(f"<b>{label}</b> <font size='7' color='#9e9e9e'>({int(weight_pct*100)}%)</font>", 
-                      ParagraphStyle('GL', fontName='Helvetica-Bold', fontSize=9, textColor=DARK_TEXT)),
+            Paragraph(f"<b>{label}</b> <font size='7' color='#9e9e9e'>({int(weight_pct*100)}%)</font>", ParagraphStyle('GL', fontName='Helvetica-Bold', fontSize=9, textColor=DARK_TEXT)),
             d
         ]
     
-    gauge_rows = []
-    for label, key, weight in score_keys:
-        val = scores.get(key, 5.0)
-        gauge_rows.append(_make_gauge_cell(label, val, weight))
+    gauge_rows = [_make_gauge_cell(label, scores.get(key, 5.0), weight) for label, key, weight in score_keys]
     
-    # Layout: 2-column grid of gauges + overall score box
-    left_col = []
-    for row in gauge_rows:
-        left_col.append(row)
-    
-    gauge_table = Table(left_col, colWidths=[55*mm, 50*mm])
+    gauge_table = Table(gauge_rows, colWidths=[55*mm, 50*mm])
     gauge_table.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('TOPPADDING', (0, 0), (-1, -1), 4),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-        ('LEFTPADDING', (0, 0), (0, -1), 8),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'), ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4), ('LEFTPADDING', (0, 0), (0, -1), 8),
     ]))
     
-    # Overall score box
     overall_box_content = [
         [Paragraph(f"<b>{overall_score}</b>", ParagraphStyle('BigScore', fontName='Helvetica-Bold', fontSize=36, textColor=grade_color, alignment=TA_CENTER))],
         [Paragraph("<font size='7'>out of 10</font>", ParagraphStyle('OutOf', fontName='Helvetica', fontSize=7, textColor=MED_TEXT, alignment=TA_CENTER))],
@@ -900,24 +1490,16 @@ def generate_pdf_report(result: dict, test_id: str) -> bytes:
     ]
     overall_box = Table(overall_box_content, colWidths=[55*mm])
     overall_box.setStyle(TableStyle([
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('BACKGROUND', (0, 0), (-1, -1), LIGHT_BG),
-        ('ROUNDEDCORNERS', [8, 8, 8, 8]),
-        ('TOPPADDING', (0, 0), (-1, 0), 12),
-        ('BOTTOMPADDING', (0, -1), (-1, -1), 12),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'), ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('BACKGROUND', (0, 0), (-1, -1), LIGHT_BG), ('ROUNDEDCORNERS', [8, 8, 8, 8]),
+        ('TOPPADDING', (0, 0), (-1, 0), 12), ('BOTTOMPADDING', (0, -1), (-1, -1), 12),
     ]))
     
     dashboard = Table([[gauge_table, overall_box]], colWidths=[110*mm, 60*mm])
-    dashboard.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-    ]))
+    dashboard.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'TOP')]))
     story.append(dashboard)
     story.append(Spacer(1, 8))
     
-    # ════════════════════════════════════════════════════════════════════════
-    # SECTION 3: KEY METRICS ROW
-    # ════════════════════════════════════════════════════════════════════════
     tech_acc = scores.get("technical_accuracy", 0)
     hr_acc = scores.get("hr_accuracy", 0)
     correct = scores.get("questions_correct", 0)
@@ -941,67 +1523,40 @@ def generate_pdf_report(result: dict, test_id: str) -> bytes:
         _metric_cell("Silent", str(silent), NEUTRAL),
     ]
     
-    # Transpose: each metric is a column with 2 rows
-    metrics_table_data = [
-        [m[0] for m in metrics_row],  # Values
-        [m[1] for m in metrics_row],  # Labels
-    ]
-    
+    metrics_table_data = [[m[0] for m in metrics_row], [m[1] for m in metrics_row]]
     col_w = 170*mm / 6
     metrics_table = Table(metrics_table_data, colWidths=[col_w]*6)
     metrics_table.setStyle(TableStyle([
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('BACKGROUND', (0, 0), (-1, -1), LIGHT_BG),
-        ('TOPPADDING', (0, 0), (-1, 0), 8),
-        ('BOTTOMPADDING', (0, -1), (-1, -1), 6),
-        ('ROUNDEDCORNERS', [6, 6, 6, 6]),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'), ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('BACKGROUND', (0, 0), (-1, -1), LIGHT_BG), ('TOPPADDING', (0, 0), (-1, 0), 8),
+        ('BOTTOMPADDING', (0, -1), (-1, -1), 6), ('ROUNDEDCORNERS', [6, 6, 6, 6]),
         ('LINEAFTER', (0, 0), (-2, -1), 0.5, HexColor("#e0e0e0")),
     ]))
     story.append(metrics_table)
     story.append(Spacer(1, 10))
     
-    # ════════════════════════════════════════════════════════════════════════
-    # SECTION 4: ROUND-BY-ROUND Q&A FEEDBACK
-    # ════════════════════════════════════════════════════════════════════════
+    ROUND_COLORS = {"communication": HexColor("#0277bd"), "technical": HexColor("#2e7d32"), "hr": HexColor("#6a1b9a")}
     
-    ROUND_COLORS = {
-        "communication": HexColor("#0277bd"),  # Blue
-        "technical": HexColor("#2e7d32"),       # Green
-        "hr": HexColor("#6a1b9a"),              # Purple
-    }
-    
-    # Get structured evaluation details if available
     rounds_data = eval_details.get("rounds", {}) if eval_details else {}
-    
-    # If no structured details, parse from the raw evaluation text
     if not rounds_data:
         rounds_data = _parse_evaluation_text_to_rounds(evaluation, result.get("conversation_log", []))
     
     for round_name, round_label in [("communication", "Communication Round"), ("technical", "Technical Round"), ("hr", "HR/Behavioral Round")]:
         round_qs = rounds_data.get(round_name, [])
-        if not round_qs:
-            continue
+        if not round_qs: continue
         
         round_color = ROUND_COLORS.get(round_name, PRIMARY)
         q_count = questions_per_round.get(round_name, len(round_qs))
         
-        # Round header bar
-        header_data = [[
-            Paragraph(f"<b>{round_label}</b>  <font size='8' color='#e0e0e0'>({q_count} questions)</font>", 
-                      ParagraphStyle('RH', fontName='Helvetica-Bold', fontSize=11, textColor=white))
-        ]]
+        header_data = [[Paragraph(f"<b>{round_label}</b>  <font size='8' color='#e0e0e0'>({q_count} questions)</font>", ParagraphStyle('RH', fontName='Helvetica-Bold', fontSize=11, textColor=white))]]
         header_tbl = Table(header_data, colWidths=[170*mm])
         header_tbl.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -1), round_color),
-            ('LEFTPADDING', (0, 0), (-1, -1), 12),
-            ('TOPPADDING', (0, 0), (-1, -1), 7),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 7),
+            ('BACKGROUND', (0, 0), (-1, -1), round_color), ('LEFTPADDING', (0, 0), (-1, -1), 12),
+            ('TOPPADDING', (0, 0), (-1, -1), 7), ('BOTTOMPADDING', (0, 0), (-1, -1), 7),
             ('ROUNDEDCORNERS', [4, 4, 0, 0]),
         ]))
         story.append(header_tbl)
         
-        # Q&A cards
         for i, qa in enumerate(round_qs):
             question = qa.get("question", "")
             answer = qa.get("answer", "")
@@ -1009,103 +1564,53 @@ def generate_pdf_report(result: dict, test_id: str) -> bytes:
             accuracy = qa.get("accuracy")
             is_silent = qa.get("is_silent", False)
             
-            # Determine answer status color
-            if is_silent or not answer or answer.startswith("[SILENT"):
-                status_color = DANGER
-                status_label = "SILENT"
+            if is_silent or not answer or answer.startswith("[SILENT"): status_color, status_label = DANGER, "SILENT"
             elif accuracy is not None:
-                if accuracy >= 0.7:
-                    status_color = SUCCESS
-                    status_label = f"{accuracy:.0%}"
-                elif accuracy >= 0.4:
-                    status_color = WARNING
-                    status_label = f"{accuracy:.0%}"
-                else:
-                    status_color = DANGER
-                    status_label = f"{accuracy:.0%}"
-            else:
-                status_color = NEUTRAL
-                status_label = ""
+                if accuracy >= 0.7: status_color, status_label = SUCCESS, f"{accuracy:.0%}"
+                elif accuracy >= 0.4: status_color, status_label = WARNING, f"{accuracy:.0%}"
+                else: status_color, status_label = DANGER, f"{accuracy:.0%}"
+            else: status_color, status_label = NEUTRAL, ""
             
-            # Truncate long answers for readability
             display_answer = answer[:300] + "..." if len(answer) > 300 else answer
-            
-            # Build Q&A card
             card_elements = []
-            
             q_prefix = f"<font color='{round_color.hexval()}'><b>Q{i+1}.</b></font> "
             card_elements.append(Paragraph(f"{q_prefix}{_escape_xml(question)}", styles['QText']))
             
-            if status_label:
-                answer_line = f"<font color='{status_color.hexval()}'>[{status_label}]</font> {_escape_xml(display_answer)}"
-            else:
-                answer_line = _escape_xml(display_answer)
+            if status_label: answer_line = f"<font color='{status_color.hexval()}'>[{status_label}]</font> {_escape_xml(display_answer)}"
+            else: answer_line = _escape_xml(display_answer)
             card_elements.append(Paragraph(f"<b>A:</b> {answer_line}", styles['AText']))
             
-            if feedback:
-                card_elements.append(Paragraph(f"<i>Feedback:</i> {_escape_xml(feedback)}", styles['FeedbackText']))
+            if feedback: card_elements.append(Paragraph(f"<i>Feedback:</i> {_escape_xml(feedback)}", styles['FeedbackText']))
             
-            # Card with left accent border
-            card_data = [[card_elements]]
-            # We use a table trick: first column is thin colored bar, second is content
-            inner_content = []
-            for elem in card_elements:
-                inner_content.append([elem])
-            
+            inner_content = [[elem] for elem in card_elements]
             inner_table = Table(inner_content, colWidths=[165*mm])
-            inner_table.setStyle(TableStyle([
-                ('TOPPADDING', (0, 0), (-1, -1), 1),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 1),
-                ('LEFTPADDING', (0, 0), (-1, -1), 0),
-            ]))
+            inner_table.setStyle(TableStyle([('TOPPADDING', (0, 0), (-1, -1), 1), ('BOTTOMPADDING', (0, 0), (-1, -1), 1), ('LEFTPADDING', (0, 0), (-1, -1), 0)]))
             
+            bg_color = HexColor("#fafafa") if i % 2 == 0 else white
             card_wrapper = Table([[" ", inner_table]], colWidths=[3*mm, 167*mm])
             card_wrapper.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (0, -1), round_color),
-                ('BACKGROUND', (1, 0), (1, -1), HexColor("#fafafa")),
-                ('LEFTPADDING', (1, 0), (1, -1), 8),
-                ('TOPPADDING', (0, 0), (-1, -1), 4),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('BACKGROUND', (0, 0), (0, -1), round_color), ('BACKGROUND', (1, 0), (1, -1), bg_color),
+                ('LEFTPADDING', (1, 0), (1, -1), 8), ('TOPPADDING', (0, 0), (-1, -1), 4),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 4), ('VALIGN', (0, 0), (-1, -1), 'TOP'),
             ]))
-            
-            # Alternate card bg
-            if i % 2 == 1:
-                card_wrapper.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (0, -1), round_color),
-                    ('BACKGROUND', (1, 0), (1, -1), white),
-                    ('LEFTPADDING', (1, 0), (1, -1), 8),
-                    ('TOPPADDING', (0, 0), (-1, -1), 4),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                ]))
             
             story.append(card_wrapper)
             story.append(Spacer(1, 2))
         
         story.append(Spacer(1, 8))
     
-    # ════════════════════════════════════════════════════════════════════════
-    # SECTION 5: OVERALL SUMMARY
-    # ════════════════════════════════════════════════════════════════════════
     story.append(Paragraph("Overall Summary", styles['SectionHeading']))
     
-    # Extract just the overall summary part (after "OVERALL SUMMARY" header)
     summary_text = ""
     if eval_details and eval_details.get("overall_summary"):
         summary_text = eval_details["overall_summary"]
     else:
-        # Parse from raw evaluation text
         if "OVERALL SUMMARY" in evaluation:
             parts = evaluation.split("OVERALL SUMMARY")
             if len(parts) > 1:
                 summary_part = parts[1]
-                # Get text before STATISTICS
-                if "STATISTICS:" in summary_part:
-                    summary_text = summary_part.split("STATISTICS:")[0]
-                else:
-                    summary_text = summary_part[:1500]
-                # Clean up separator chars
+                if "STATISTICS:" in summary_part: summary_text = summary_part.split("STATISTICS:")[0]
+                else: summary_text = summary_part[:1500]
                 summary_text = summary_text.replace("=" * 60, "").replace("-" * 40, "").strip()
     
     if summary_text:
@@ -1115,22 +1620,13 @@ def generate_pdf_report(result: dict, test_id: str) -> bytes:
                 story.append(Paragraph(_escape_xml(para), styles['BodyText2']))
                 story.append(Spacer(1, 4))
     
-    # ════════════════════════════════════════════════════════════════════════
-    # SECTION 6: RECOMMENDATIONS (if available)
-    # ════════════════════════════════════════════════════════════════════════
     recommendations = eval_details.get("recommendations", []) if eval_details else []
     if recommendations:
         story.append(Paragraph("Recommendations", styles['SectionHeading']))
         for i, rec in enumerate(recommendations, 1):
-            story.append(Paragraph(
-                f"<font color='{ACCENT.hexval()}'><b>{i}.</b></font> {_escape_xml(rec)}",
-                styles['BodyText2']
-            ))
+            story.append(Paragraph(f"<font color='{ACCENT.hexval()}'><b>{i}.</b></font> {_escape_xml(rec)}", styles['BodyText2']))
             story.append(Spacer(1, 3))
     
-    # ════════════════════════════════════════════════════════════════════════
-    # FOOTER
-    # ════════════════════════════════════════════════════════════════════════
     story.append(Spacer(1, 20))
     story.append(HRFlowable(width="100%", thickness=0.5, color=HexColor("#e0e0e0")))
     story.append(Spacer(1, 6))
@@ -1139,34 +1635,18 @@ def generate_pdf_report(result: dict, test_id: str) -> bytes:
         ParagraphStyle('Footer', alignment=TA_CENTER)
     ))
     
-    # ── Build PDF ───────────────────────────────────────────────────────────
     doc.build(story)
     pdf_buffer.seek(0)
     return pdf_buffer.read()
 
 
 def _escape_xml(text: str) -> str:
-    """Escape XML special characters for ReportLab Paragraphs"""
-    if not text:
-        return ""
-    return (
-        text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-            .replace("'", "&#39;")
-    )
+    if not text: return ""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;")
 
 def _parse_evaluation_text_to_rounds(evaluation: str, conversation_log: list) -> dict:
-    """
-    Parse the raw evaluation text into structured round data.
-    
-    Falls back to conversation_log if evaluation text doesn't have 
-    clear Q&A sections (backward compatibility).
-    """
     rounds = {"communication": [], "technical": [], "hr": []}
     
-    # Try parsing from evaluation text first
     if evaluation:
         current_round = None
         lines = evaluation.split("\n")
@@ -1174,72 +1654,45 @@ def _parse_evaluation_text_to_rounds(evaluation: str, conversation_log: list) ->
         while i < len(lines):
             line = lines[i].strip()
             
-            # Detect round headers
-            if "COMMUNICATION ROUND" in line.upper():
-                current_round = "communication"
-            elif "TECHNICAL ROUND" in line.upper():
-                current_round = "technical"
-            elif "HR" in line.upper() and "ROUND" in line.upper() and "FEEDBACK" in line.upper():
-                current_round = "hr"
-            elif "OVERALL SUMMARY" in line.upper():
-                current_round = None
+            if "COMMUNICATION ROUND" in line.upper(): current_round = "communication"
+            elif "TECHNICAL ROUND" in line.upper(): current_round = "technical"
+            elif "HR" in line.upper() and "ROUND" in line.upper() and "FEEDBACK" in line.upper(): current_round = "hr"
+            elif "OVERALL SUMMARY" in line.upper(): current_round = None
             
-            # Parse Q&A blocks
             if current_round and line.startswith("Q") and ". AI Question:" in line:
                 question = line.split("AI Question:", 1)[1].strip() if "AI Question:" in line else line
-                answer = ""
-                feedback = ""
-                accuracy = None
+                answer = ""; feedback = ""; accuracy = None
                 
-                # Look ahead for answer and feedback
                 j = i + 1
                 while j < len(lines) and j < i + 5:
                     next_line = lines[j].strip()
-                    if next_line.startswith("User Answer:"):
-                        answer = next_line.split("User Answer:", 1)[1].strip()
+                    if next_line.startswith("User Answer:"): answer = next_line.split("User Answer:", 1)[1].strip()
                     elif next_line.startswith("Feedback:"):
                         fb_text = next_line.split("Feedback:", 1)[1].strip()
-                        # Extract accuracy if present
                         import re
                         acc_match = re.search(r'\(Accuracy:\s*(\d+)%\)', fb_text)
                         if acc_match:
                             accuracy = int(acc_match.group(1)) / 100
                             fb_text = re.sub(r'\s*\(Accuracy:\s*\d+%\)', '', fb_text).strip()
                         feedback = fb_text
-                    elif next_line.startswith("Q") and ". AI Question:" in next_line:
-                        break
-                    elif next_line.startswith("=" * 10):
-                        break
+                    elif next_line.startswith("Q") and ". AI Question:" in next_line: break
+                    elif next_line.startswith("=" * 10): break
                     j += 1
                 
                 is_silent = "[SILENT" in answer.upper() if answer else True
-                
-                rounds[current_round].append({
-                    "question": question,
-                    "answer": answer,
-                    "feedback": feedback,
-                    "accuracy": accuracy,
-                    "is_silent": is_silent,
-                })
+                rounds[current_round].append({"question": question, "answer": answer, "feedback": feedback, "accuracy": accuracy, "is_silent": is_silent})
             
             i += 1
     
-    # If parsing didn't find anything, use conversation_log
     total_parsed = sum(len(v) for v in rounds.values())
     if total_parsed == 0 and conversation_log:
         for entry in conversation_log:
             stage = entry.get("stage", "").lower()
             if stage in rounds:
-                rounds[stage].append({
-                    "question": entry.get("ai_message", ""),
-                    "answer": entry.get("user_response", ""),
-                    "feedback": "",
-                    "accuracy": None,
-                    "is_silent": not entry.get("user_response"),
-                })
+                rounds[stage].append({"question": entry.get("ai_message", ""), "answer": entry.get("user_response", ""), "feedback": "", "accuracy": None, "is_silent": not entry.get("user_response")})
     
     return rounds
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8030) 
+    uvicorn.run(app, host="0.0.0.0", port=8030)

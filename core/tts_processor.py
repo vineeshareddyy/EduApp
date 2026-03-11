@@ -66,6 +66,29 @@ class UnifiedTTSProcessor:
         self.device = device
 
         logger.info("[TTS] Loading ChatterboxTTS on device=%s ...", self.device)
+        # --- Patch: fix perth watermarker if native lib missing ---
+        try:
+            import perth
+
+            class _SafeNoOpWatermarker:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def apply(self, audio, *args, **kwargs):
+                    return audio
+
+                def apply_watermark(self, audio, *args, **kwargs):
+                    return audio
+
+                def __call__(self, audio, *args, **kwargs):
+                    return audio
+
+            # Force override regardless of internal state
+            perth.PerthImplicitWatermarker = _SafeNoOpWatermarker
+            logger.warning("[TTS] Using safe no-op watermarker stub")
+
+        except Exception as e:
+            logger.warning("[TTS] Could not patch perth watermarker: %s", e)
         self.model = ChatterboxTTS.from_pretrained(device=self.device)  # exposes .sr
 
         # session_id -> chosen audio_prompt_path

@@ -606,15 +606,26 @@ class DatabaseManager:
             conn = self.get_mysql_connection()
             cursor = conn.cursor(dictionary=True)
 
+            # if student_id:
+            #     # ✅ Fetch specific logged-in student
+            #     logger.info(f"📋 Fetching student with ID: {student_id}")
+            #     cursor.execute("""
+            #         SELECT ID, First_Name, Last_Name 
+            #         FROM tbl_Student 
+            #         WHERE ID = %s
+            #         LIMIT 1
+            #     """, (student_id,))
+
             if student_id:
-                # ✅ Fetch specific logged-in student
+                # ✅ Fetch specific logged-in student (validated active)
                 logger.info(f"📋 Fetching student with ID: {student_id}")
                 cursor.execute("""
                     SELECT ID, First_Name, Last_Name 
                     FROM tbl_Student 
-                    WHERE ID = %s
+                    WHERE ID = %s AND status = 1 AND Status_code = 'st'
                     LIMIT 1
                 """, (student_id,))
+                
             else:
                 # ⚠️ Fallback to random (testing only)
                 logger.warning("⚠️ No student_id provided - random student mode")

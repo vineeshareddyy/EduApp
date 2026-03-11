@@ -56,7 +56,7 @@ class Config:
     # =========================================================================
     MYSQL_HOST = os.getenv("MYSQL_HOST", "192.168.48.201")
     MYSQL_PORT = os.getenv("MYSQL_PORT", "3306")
-    MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "SuperDB")
+    MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "SuperDBDB")
     MYSQL_USER = os.getenv("MYSQL_USER", "sa")
     MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "Welcome@123")
 
@@ -222,6 +222,31 @@ class Config:
     WI_SESSION_MAX_SECONDS = int(os.getenv("WI_SESSION_MAX_SECONDS", "2700"))  # 45 min
 
     # =========================================================================
+    # BIOMETRIC PROCTORING SETTINGS (Weekly Interview)
+    # =========================================================================
+    # Pre-interview face gate
+    FACE_GATE_SIMILARITY_THRESHOLD = float(os.getenv("FACE_GATE_SIMILARITY_THRESHOLD", "0.5"))
+    FACE_GATE_YOLO_MODEL = os.getenv("FACE_GATE_YOLO_MODEL", "yolov8m.pt")  # accurate for gate
+
+    # Continuous proctoring during interview
+    PROCTOR_FRAME_INTERVAL_SECONDS = int(os.getenv("PROCTOR_FRAME_INTERVAL_SECONDS", "5"))
+    PROCTOR_YOLO_MODEL = os.getenv("PROCTOR_YOLO_MODEL", "yolov8n.pt")  # fast for continuous
+
+    # Phone detection
+    PHONE_DETECTION_CONFIDENCE = float(os.getenv("PHONE_DETECTION_CONFIDENCE", "0.40"))
+    PHONE_MAX_WARNINGS = int(os.getenv("PHONE_MAX_WARNINGS", "3"))
+
+    # Head turn detection (yaw angle in degrees)
+    HEAD_TURN_YAW_THRESHOLD = float(os.getenv("HEAD_TURN_YAW_THRESHOLD", "35.0"))
+    HEAD_TURN_MAX_WARNINGS = int(os.getenv("HEAD_TURN_MAX_WARNINGS", "3"))
+
+    # Voice verification during interview
+    VOICE_VERIFY_ENABLED = os.getenv("VOICE_VERIFY_ENABLED", "true").lower() == "true"
+    VOICE_SIMILARITY_THRESHOLD = float(os.getenv("VOICE_SIMILARITY_THRESHOLD", "0.45"))
+    VOICE_MAX_WARNINGS = int(os.getenv("VOICE_MAX_WARNINGS", "3"))
+    VOICE_MIN_AUDIO_BYTES = int(os.getenv("VOICE_MIN_AUDIO_BYTES", "16000"))  # ~1 sec at 16kHz
+    
+    # =========================================================================
     # TTS CONFIG (merged)
     # =========================================================================
     REF_AUDIO_DIR = (Path(__file__).resolve().parent.parent / "core/ref_audios")
@@ -290,7 +315,7 @@ class Config:
     # =========================================================================
     # PERFORMANCE
     # =========================================================================
-    THREAD_POOL_MAX_WORKERS = int(os.getenv("THREAD_POOL_MAX_WORKERS", "20"))
+    THREAD_POOL_MAX_WORKERS = int(os.getenv("THREAD_POOL_MAX_WORKERS", "4"))
     MONGO_MAX_POOL_SIZE = int(os.getenv("MONGO_MAX_POOL_SIZE", "50"))
     MONGO_SERVER_SELECTION_TIMEOUT = int(
         os.getenv("MONGO_SERVER_SELECTION_TIMEOUT", "5000")

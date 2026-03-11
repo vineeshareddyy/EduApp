@@ -501,7 +501,8 @@ class UltraFastSessionManagerWithSilenceHandling:
             if any(phrase in ai_lower for phrase in silence_phrases):
                 continue
             
-            return ai_msg
+            # ✅ Prefer clean_question if stored (avoids re-asking with irrelevant redirect prefix)
+            return exchange.get("clean_question") or ai_msg
         
         return None
 
@@ -1049,6 +1050,16 @@ Reply with ONLY: SAME:<number> OR DIFFERENT"""
         
         return False
 
+    def _has_met_minimum_duration(self, session_data, min_seconds: int = 840) -> bool:
+        elapsed = time.time() - session_data.created_at
+        if elapsed >= min_seconds:
+            return True
+        logger.warning(
+            f"⏩ Session {session_data.session_id} ended after only "
+            f"{elapsed/60:.1f}m — skipping MongoDB save (minimum: {min_seconds/60:.0f}m)"
+        )
+        return False
+
     def _extract_question_only(self, text: str) -> str:
         """
         Extract only the question from AI response, removing acknowledgments.
@@ -1085,6 +1096,15 @@ Reply with ONLY: SAME:<number> OR DIFFERENT"""
             "Sure.",
             "\"That's not quite what I was asking.\"",
             "\"That's a bit different from my question.\"",
+            "\"That's a bit off from my question.\"",
+            "That doesn't answer the question.",
+            "That doesn't answer the question!",
+            "I don't think that's related.",
+            "I don't think that's related!",
+            "That's not quite what I asked.",
+            "That's not quite what I asked!",
+            "That's not quite right.",
+            "That's not quite right!",
         ]
         
         # Remove acknowledgments from start
@@ -1505,15 +1525,16 @@ Reply with ONLY: SAME:<number> OR DIFFERENT"""
 
             try:
                 if evaluation_text is not None and score is not None:
-                    saved = await self.db_manager.save_session_result_fast(session_data, evaluation_text, score)
-                    if not saved:
-                        logger.error("Save (time-cutoff) failed for %s", session_data.session_id)
+                    if self._has_met_minimum_duration(session_data):
+                        saved = await self.db_manager.save_session_result_fast(session_data, evaluation_text, score)
+                        if not saved:
+                            logger.error("Save (time-cutoff) failed for %s", session_data.session_id)
             except Exception as e_save:
                 logger.exception("Save error (time-cutoff): %s", e_save)
 
             try:
                 conv_log = getattr(session_data, "conversation_log", [])
-                if conv_log:
+                if conv_log and self._has_met_minimum_duration(session_data):
                     save_qa_to_mongodb(
                         session_id=session_data.session_id,
                         student_id=session_data.student_id,
@@ -1916,8 +1937,8 @@ Reply with ONLY: SAME:<number> OR DIFFERENT"""
                                 logger.info(f"🔁 Skipping silence phrase at index {i}: '{ai_msg[:50]}...'")
                                 continue
                             
-                            # ✅ Found a real question!
-                            last_question = ai_msg
+                            # ✅ Found a real question! Prefer clean_question if stored (avoids irrelevant redirect prefix)
+                            last_question = exchange.get("clean_question") or ai_msg
                             logger.info(f"🔁 Found actual question at index {i}: '{last_question[:50]}...'")
                             break
                                     
@@ -2037,22 +2058,28 @@ Reply with ONLY: SAME:<number> OR DIFFERENT"""
 
                 # Determine if this is a PURE skip request (not a long irrelevant sentence)
                 is_pure_skip = False
-                if contains_skip_phrase and len(transcript_words) <= 15:
+                if contains_skip_phrase and len(transcript_words) <= 20:
                     # Words that are part of skip phrases (ignore these when counting extra content)
                     skip_words = {
-                        "skip", "i", "dont", "don't", "do", "not", "know", "can't", "cant", 
-                        "cannot", "answer", "sure", "no", "idea", "pass", "this", "it", 
+                        "skip", "i", "dont", "don't", "do", "not", "know", "can't", "cant",
+                        "cannot", "answer", "sure", "no", "idea", "pass", "this", "it",
                         "next", "question", "move", "on", "the", "please", "um", "uh",
-                        "have", "any", "a", "an", "to", "that", "one"
+                        "have", "any", "a", "an", "to", "that", "one",
+                        "can", "u", "you", "could", "would", "for", "me", "just", "maybe",
+                        "sorry", "like", "kind", "of", "help", "want", "need", "will",
+                        "really", "actually", "so", "well", "ok", "okay", "right", "then",
                     }
-                    
-                    # Count words that are NOT part of skip phrases
-                    non_skip_words = [w for w in transcript_words if w.lower() not in skip_words]
-                    
-                    # Pure skip = 3 or fewer extra words
+
+                    import re
+                    # Strip punctuation before comparing (fixes "know," not matching "know")
+                    clean_words = [re.sub(r'[^\w]', '', w) for w in transcript_words]
+                    non_skip_words = [w for w in clean_words if w and w.lower() not in skip_words]
+
+                    # Pure skip = 5 or fewer extra words
                     # "I don't know" → 0 non-skip words → SKIP ✅
+                    # "i dont know, can u skip this question for me" → 0 non-skip words → SKIP ✅
                     # "I don't know what is happening with me today" → many non-skip words → NOT SKIP ❌
-                    is_pure_skip = len(non_skip_words) <= 3
+                    is_pure_skip = len(non_skip_words) <= 5
                     
                     logger.info(f"🔍 Skip detection: total_words={len(transcript_words)}, non_skip_words={len(non_skip_words)} {non_skip_words}, is_pure_skip={is_pure_skip}")
 
@@ -2210,6 +2237,9 @@ Reply with ONLY: SAME:<number> OR DIFFERENT"""
                     concept = session_data.current_concept or "skip_handled"
                     is_followup = getattr(session_data, "_last_question_followup", False)
                     session_data.add_exchange(combined_response, "[SKIP]", 0.3, concept, is_followup)
+                    # ✅ Store clean question so silence re-ask doesn't include skip acknowledgment
+                    if session_data.conversation_log:
+                        session_data.conversation_log[-1]["clean_question"] = next_question
                     
                     # Set AI responding lock
                     session_data.ai_is_responding = True
@@ -2294,8 +2324,8 @@ Reply with ONLY: SAME:<number> OR DIFFERENT"""
                             if any(phrase in ai_msg_lower for phrase in silence_prompt_phrases):
                                 continue
                             
-                            # Found a real question!
-                            last_question = ai_msg
+                            # Found a real question! Prefer clean_question to avoid redirect prefix
+                            last_question = exchange.get("clean_question") or ai_msg
                             break
                         
                         if last_question:
@@ -2476,6 +2506,9 @@ Reply with ONLY: SAME:<number> OR DIFFERENT"""
                                     concept = session_data.current_concept or "irrelevant_handled"
                                     is_followup = getattr(session_data, "_last_question_followup", False)
                                     session_data.add_exchange(combined_response, "[IRRELEVANT]", 0.3, concept, is_followup)
+                                    # ✅ Store clean question so repeat doesn't include the redirect phrase
+                                    if session_data.conversation_log:
+                                        session_data.conversation_log[-1]["clean_question"] = next_question
                                     
                                     session_data.ai_is_responding = True
                                     
@@ -3592,28 +3625,29 @@ Reply with ONLY: SAME:<number> OR DIFFERENT"""
                 completion_message = (completion_message or "").strip()
 
             completion_message = completion_message or " "
-            try:
-                conv_log = getattr(session_data, "conversation_log", [])
-                if conv_log:
-                    save_qa_to_mongodb(
-                        session_id=session_data.session_id,
-                        student_id=session_data.student_id,
-                        student_name=session_data.student_name,
-                        conversation_log=conv_log,
-                        test_id=session_data.test_id
-                    )
-            except Exception as qa_err:
-                logger.error(f"Q&A save failed: {qa_err}")
+            if self._has_met_minimum_duration(session_data):
+                try:
+                    conv_log = getattr(session_data, "conversation_log", [])
+                    if conv_log:
+                        save_qa_to_mongodb(
+                            session_id=session_data.session_id,
+                            student_id=session_data.student_id,
+                            student_name=session_data.student_name,
+                            conversation_log=conv_log,
+                            test_id=session_data.test_id
+                        )
+                except Exception as qa_err:
+                    logger.error(f"Q&A save failed: {qa_err}")
 
-            evaluation_text, score, detailed_evaluation = await self.conversation_manager.generate_fast_evaluation(session_data)
-            # ✅ FIX: Store detailed_evaluation on session_data so it gets saved to MongoDB
-            session_data.detailed_evaluation = detailed_evaluation
-            save_success = await self.db_manager.save_session_result_fast(session_data, evaluation_text, score)
-            if not save_success:
-                logger.error("Failed to save session %s", session_data.session_id)
+                evaluation_text, score, detailed_evaluation = await self.conversation_manager.generate_fast_evaluation(session_data)
+                # ✅ FIX: Store detailed_evaluation on session_data so it gets saved to MongoDB
+                session_data.detailed_evaluation = detailed_evaluation
+                save_success = await self.db_manager.save_session_result_fast(session_data, evaluation_text, score)
+                if not save_success:
+                    logger.error("Failed to save session %s", session_data.session_id)
 
-            # ════ AUTO PDF + S3 UPLOAD ════
-            await _auto_generate_and_upload_pdf(session_data, detailed_evaluation, evaluation_text, score)
+                # ════ AUTO PDF + S3 UPLOAD ════
+                await _auto_generate_and_upload_pdf(session_data, detailed_evaluation, evaluation_text, score)
 
             await self._send_quick_message(session_data, {
                 "type": "conversation_end",
@@ -3730,71 +3764,93 @@ Reply with ONLY: SAME:<number> OR DIFFERENT"""
             logger.info(f"🎬 Formal closing message: '{closing_message}'")
             
             # Save Q&A to MongoDB
-            try:
-                conv_log = getattr(session_data, "conversation_log", [])
-                if conv_log:
-                    save_qa_to_mongodb(
-                        session_id=session_data.session_id,
-                        student_id=session_data.student_id,
-                        student_name=session_data.student_name,
-                        conversation_log=conv_log,
-                        test_id=session_data.test_id
-                    )
-            except Exception as qa_err:
-                logger.error(f"Q&A save failed: {qa_err}")
-            
-            # ✅ ENHANCED: Generate comprehensive evaluation
-            evaluation_text, score, detailed_evaluation = None, None, None
-            try:
-                evaluation_text, score, detailed_evaluation = await self.conversation_manager.generate_fast_evaluation(session_data)
-                # ✅ FIX: Store detailed_evaluation on session_data so it gets saved to MongoDB
-                session_data.detailed_evaluation = detailed_evaluation
-                #override communication score with real-time calculated value
-                if detailed_evaluation and final_comm_score:
-                    detailed_evaluation["communication_score"] = final_comm_score["total_score"]
-                    detailed_evaluation["communication_breakdown"] = final_comm_score
-                # Save to database
-                save_success = await self.db_manager.save_session_result_fast(session_data, evaluation_text, score)
-                if not save_success:
-                    logger.error("Failed to save session %s", session_data.session_id)
-                    
-            except Exception as eval_err:
-                logger.error(f"Evaluation generation error: {eval_err}")
-                # Create fallback evaluation
-                detailed_evaluation = {
-                    "overall_score": 50,
-                    "grade": "C",
-                    "summary": "Evaluation could not be completed.",
-                    "strengths": [],
-                    "weaknesses": [],
-                    "areas_for_improvement": [],
-                    "question_analysis": [],
-                    "recommendations": [],
-                    "raw_stats": {},
-                    "session_info": {
-                        "student_name": session_data.student_name,
-                        "session_id": session_data.session_id
-                    }
-                }
-                evaluation_text = "Evaluation encountered an error."
-                score = 50.0
-            
-            # ════ AUTO PDF + S3 UPLOAD ════
-            await _auto_generate_and_upload_pdf(session_data, detailed_evaluation, evaluation_text, score)
+            if self._has_met_minimum_duration(session_data):
 
-            # ✅ FIX 2: Send stop_audio FIRST to clear frontend queue
+                try:
+                    conv_log = getattr(session_data, "conversation_log", [])
+                    if conv_log:
+                        save_qa_to_mongodb(
+                            session_id=session_data.session_id,
+                            student_id=session_data.student_id,
+                            student_name=session_data.student_name,
+                            conversation_log=conv_log,
+                            test_id=session_data.test_id
+                        )
+                except Exception as qa_err:
+                    logger.error(f"Q&A save failed: {qa_err}")
+                
+                # ✅ ENHANCED: Generate comprehensive evaluation
+                evaluation_text, score, detailed_evaluation = None, None, None
+                try:
+                    evaluation_text, score, detailed_evaluation = await self.conversation_manager.generate_fast_evaluation(session_data)
+                    # ✅ FIX: Store detailed_evaluation on session_data so it gets saved to MongoDB
+                    session_data.detailed_evaluation = detailed_evaluation
+                    #override communication score with real-time calculated value
+                    if detailed_evaluation and final_comm_score:
+                        detailed_evaluation["communication_score"] = final_comm_score["total_score"]
+                        detailed_evaluation["communication_breakdown"] = final_comm_score
+                    # Save to database
+                    save_success = await self.db_manager.save_session_result_fast(session_data, evaluation_text, score)
+                    if not save_success:
+                        logger.error("Failed to save session %s", session_data.session_id)
+                        
+                except Exception as eval_err:
+                    logger.error(f"Evaluation generation error: {eval_err}")
+                    # Create fallback evaluation
+                    detailed_evaluation = {
+                        "overall_score": 50,
+                        "grade": "C",
+                        "summary": "Evaluation could not be completed.",
+                        "strengths": [],
+                        "weaknesses": [],
+                        "areas_for_improvement": [],
+                        "question_analysis": [],
+                        "recommendations": [],
+                        "raw_stats": {},
+                        "session_info": {
+                            "student_name": session_data.student_name,
+                            "session_id": session_data.session_id
+                        }
+                    }
+                    evaluation_text = "Evaluation encountered an error."
+                    score = 50.0
+                
+                # ════ AUTO PDF + S3 UPLOAD ════
+                await _auto_generate_and_upload_pdf(session_data, detailed_evaluation, evaluation_text, score)
+
+            # Send stop_audio FIRST to clear any playing audio
             await self._send_quick_message(session_data, {
                 "type": "stop_audio",
                 "reason": "session_ending"
             })
-            await asyncio.sleep(0.2)  # Brief delay for frontend to clear queue
-            # ✅ Send closing message with DETAILED evaluation
+            await asyncio.sleep(0.2)
+
+            # ✅ Show closing text on screen while audio plays (does NOT trigger feedback form)
+            await self._send_quick_message(session_data, {
+                "type": "ai_response",
+                "text": closing_message,
+                "status": "closing",
+            })
+
+            # ✅ Stream closing audio FIRST — student hears goodbye before feedback form appears
+            async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
+                closing_message, session_id=session_data.session_id
+            ):
+                if audio_chunk:
+                    await self._send_quick_message(session_data, {
+                        "type": "audio_chunk",
+                        "audio": audio_chunk.hex(),
+                        "status": "closing",
+                    })
+            await self._send_quick_message(session_data, {"type": "audio_end", "status": "closing"})
+
+            # ✅ NOW send conversation_end — triggers feedback form only AFTER audio finishes
             await self._send_quick_message(session_data, {
                 "type": "conversation_end",
                 "text": closing_message,
                 "evaluation": evaluation_text,
                 "score": score,
-                "detailed_evaluation": detailed_evaluation,  # ✅ NEW: Include full evaluation
+                "detailed_evaluation": detailed_evaluation,
                 "communication_score": final_comm_score,
                 "pdf_url": f"/download_results/{session_data.session_id}",
                 "status": "complete",
@@ -3808,18 +3864,6 @@ Reply with ONLY: SAME:<number> OR DIFFERENT"""
                     "extended_mode_used": extended_mode_used
                 }
             })
-            
-            # Stream closing audio
-            async for audio_chunk in self.tts_processor.generate_ultra_fast_stream(
-                closing_message, session_id=session_data.session_id
-            ):
-                if audio_chunk:
-                    await self._send_quick_message(session_data, {
-                        "type": "audio_chunk",
-                        "audio": audio_chunk.hex(),
-                        "status": "closing",
-                    })
-            await self._send_quick_message(session_data, {"type": "audio_end", "status": "closing"})
             
         except Exception as e:
             logger.error("Formal session finalization error: %s", e)
